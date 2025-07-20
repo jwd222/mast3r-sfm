@@ -23,23 +23,6 @@ This pipeline uses **MASt3R**, a model built on **DUST3R**, to address these iss
 
 This project's script acts as the critical bridge, taking the powerful initial model from MASt3R and converting it into the standard format used by COLMAP, the gold-standard tool for high-accuracy bundle adjustment and dense reconstruction.
 
-## Workflow
-
-The end-to-end process can be visualized as follows:
-
-```mermaid
-graph TD
-    A[Image Dataset] -->|1. Run Python Script| B(MASt3R Global Alignment & BA);
-    B --> C{Initial Sparse Model<br>(points3D.txt, images.txt, cameras.txt)};
-    C -->|2. Run COLMAP BA| D(COLMAP Bundle Adjustment);
-    D --> E{Refined Sparse Model};
-    E -->|3. Run COLMAP Dense| F(Dense Point Cloud<br>dense.ply);
-
-    style B fill:#e6f3ff,stroke:#333,stroke-width:2px
-    style D fill:#d5f5e3,stroke:#333,stroke-width:2px
-    style F fill:#fff2cc,stroke:#333,stroke-width:2px
-```
-
 ## Prerequisites
 
 1.  **Conda/Mamba:** For managing the Python environment.
