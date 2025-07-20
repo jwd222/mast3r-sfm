@@ -16,7 +16,6 @@ from functools import lru_cache
 from scipy import sparse as sp
 import copy
 import scipy.cluster.hierarchy as sch
-from collections import defaultdict
 
 from mast3r.utils.misc import mkdir_for, hash_md5
 from mast3r.cloud_opt.utils.losses import gamma_loss
@@ -33,7 +32,7 @@ from dust3r.viz import SceneViz
 
 
 class SparseGA():
-    def __init__(self, img_paths, pairs_in, res_fine, anchors, canonical_paths=None, corres_info=None):
+    def __init__(self, img_paths, pairs_in, res_fine, anchors, canonical_paths=None):
         def fetch_img(im):
             def torgb(x): return (x[0].permute(1, 2, 0).numpy() * .5 + .5).clip(min=0., max=1.)
             for im1, im2 in pairs_in:
@@ -56,11 +55,6 @@ class SparseGA():
             self.pts3d_colors.append(im[y, x])
             assert self.pts3d_colors[-1].shape == self.pts3d[i].shape
         self.n_imgs = len(self.imgs)
-        # Store the correspondences passed from the alignment function
-        if corres_info:
-            self._corres_matches = corres_info[0]  # This is imgs_slices
-            self._corres_2d = corres_info[1]      # This is corres2d
-
 
     def get_focals(self):
         return torch.tensor([ff[0, 0] for ff in self.intrinsics]).to(self.working_device)
@@ -113,130 +107,7 @@ class SparseGA():
         show_reconstruction(self.imgs, self.intrinsics if show_cams else None, self.cam2w,
                             [p.clip(min=-50, max=50) for p in pts3d],
                             masks=[c > 1 for c in confs])
-        
-    ####################################################################################################
-    def get_correspondences(self):
-        """
-        Reconstructs the global correspondences from the pairwise matches
-        used during optimization. This is essential for building COLMAP tracks.
 
-        Returns:
-            unique_pts3d (Tensor): A tensor of unique 3D points in the world frame.
-            observations (list): A list where each element corresponds to a unique 3D point.
-                                 Each element is another list of tuples, where each tuple
-                                 is an observation: (image_id, point2d_coords).
-        """
-        if not hasattr(self, '_corres_matches') or self._corres_matches is None:
-            raise AttributeError("Correspondence information was not stored in the SparseGA object. "
-                               "Please ensure sparse_global_alignment passes it to the constructor.")
-
-        # This method uses a graph-based approach to find connected components (tracks)
-        # Calculate start index for each image's points in a flattened array
-        point_offsets = np.cumsum([0] + [len(p) for p in self.pts3d])
-        total_points = point_offsets[-1]
-
-        # Use a Disjoint Set Union (DSU) data structure for efficiency
-        parent = list(range(total_points))
-        def find(i):
-            if parent[i] == i:
-                return i
-            parent[i] = find(parent[i])
-            return parent[i]
-        def union(i, j):
-            root_i = find(i)
-            root_j = find(j)
-            if root_i != root_j:
-                parent[root_j] = root_i
-
-        # === LOOP 1 ===
-        # Build the graph by uniting corresponding points from each image pair match.
-        for s in tqdm(self._corres_matches, desc="[1/4] Building correspondence graph (DSU)"):
-            # Get absolute indices for points in the correspondence
-            abs_indices1 = point_offsets[s.img1] + np.arange(s.slice1.start, s.slice1.stop)
-            abs_indices2 = point_offsets[s.img2] + np.arange(s.slice2.start, s.slice2.stop)
-
-            # Union each corresponding pair
-            for i1, i2 in zip(abs_indices1, abs_indices2):
-                union(i1, i2)
-
-        # === LOOP 2 ===
-        # Group all points by their root parent to form the tracks.
-        tracks = defaultdict(list)
-        for i in tqdm(range(total_points), desc="[2/4] Grouping points into tracks"):
-            root = find(i)
-            tracks[root].append(i)
-
-        # === LOOP 3 ===
-        # Build a helper map for quick 2D point lookup.
-        local_pt_to_2d = {}
-        iterator = tqdm(self._corres_matches, desc="[3/4] Building 2D point lookup map", unit="pairs")
-        for s in iterator:
-            local_indices1 = np.arange(s.slice1.start, s.slice1.stop)
-            for i, local_idx in enumerate(local_indices1):
-                local_pt_to_2d[(s.img1, local_idx)] = to_numpy(s.pix1[i])
-            
-            local_indices2 = np.arange(s.slice2.start, s.slice2.stop)
-            for i, local_idx in enumerate(local_indices2):
-                local_pt_to_2d[(s.img2, local_idx)] = to_numpy(s.pix2[i])
-
-        # === LOOP 4 ===
-        # Process each track to calculate the final 3D point and collect all its 2D observations.
-        unique_pts3d_list = []
-        observations_list = []
-        iterator = tqdm(tracks.items(), desc="[4/4] Processing tracks to create 3D points")
-        for track_id, point_indices in iterator:
-            if not point_indices: continue
-
-            track_points_3d_views = []
-            track_observations = []
-            
-            processed_observations = set() # Used to prevent duplicate observations
-
-            for abs_idx in point_indices:
-                img_idx = np.searchsorted(point_offsets, abs_idx, side='right') - 1
-                local_idx = abs_idx - point_offsets[img_idx]
-                
-                track_points_3d_views.append(self.pts3d[img_idx][local_idx])
-                
-                pt2d = local_pt_to_2d.get((img_idx, local_idx))
-                if pt2d is not None:
-                    # The key includes image and coordinates to avoid adding the same
-                    # observation multiple times if the graph has cycles.
-                    obs_key = (img_idx, tuple(pt2d))
-                    if obs_key not in processed_observations:
-                        track_observations.append((img_idx, pt2d))
-                        processed_observations.add(obs_key)
-
-            if track_points_3d_views:
-                # The final 3D point is the average of its positions from all observing views.
-                final_3d_point = torch.mean(torch.stack(track_points_3d_views), dim=0)
-                
-                unique_pts3d_list.append(final_3d_point)
-                observations_list.append(track_observations)
-            # from Claude, commented as we only test for 2 images and so len(track_points_3d_views) is always 2
-            # if track_points_3d_views and len(track_points_3d_views) > 2:
-            #     # # The final 3D point is the average of its positions from all observing views.
-            #     # final_3d_point = torch.mean(torch.stack(track_points_3d_views), dim=0)
-            #     # from Claude
-            #     # Optional: Remove outliers before averaging
-            #     # if len(track_points_3d_views) > 2:
-            #     # Remove points that are too far from the median
-            #     stack = torch.stack(track_points_3d_views)
-            #     median_point = torch.median(stack, dim=0)[0]
-            #     distances = torch.norm(stack - median_point, dim=1)
-            #     threshold = torch.quantile(distances, 0.8)  # Keep 80% closest points
-            #     mask = distances <= threshold
-            #     if mask.sum() > 0:
-            #         track_points_3d_views = [track_points_3d_views[i] for i in range(len(mask)) if mask[i]]
-            #     final_3d_point = torch.mean(torch.stack(track_points_3d_views), dim=0)
-                
-            #     unique_pts3d_list.append(final_3d_point)
-            #     observations_list.append(track_observations)
-        if not unique_pts3d_list:
-             return torch.empty(0, 3, device=self.working_device), []
-             
-        return torch.stack(unique_pts3d_list), observations_list
-####################################################################################################
 
 def convert_dust3r_pairs_naming(imgs, pairs_in):
     for pair_id in range(len(pairs_in)):
@@ -318,11 +189,8 @@ def sparse_global_alignment(imgs, pairs_in, cache_path, model, subsample=8, desc
     imgs, res_coarse, res_fine = sparse_scene_optimizer(
         imgs, subsample, imsizes, pps, base_focals, core_depth, anchors, corres, corres2d, preds_21, canonical_paths, mst,
         shared_intrinsics=shared_intrinsics, cache_path=cache_path, device=device, dtype=dtype, **kw)
-    
-    # corres is a tuple: (all_confs, confs_sum, imgs_slices). We need imgs_slices.
-    corres_info = (corres[2], corres2d)
 
-    return SparseGA(imgs, pairs_in, res_fine or res_coarse, anchors, canonical_paths, corres_info=corres_info)
+    return SparseGA(imgs, pairs_in, res_fine or res_coarse, anchors, canonical_paths)
 
 
 def sparse_scene_optimizer(imgs, subsample, imsizes, pps, base_focals, core_depth, anchors, corres, corres2d,
@@ -343,7 +211,7 @@ def sparse_scene_optimizer(imgs, subsample, imsizes, pps, base_focals, core_dept
     quats = [nn.Parameter(vec0001.clone()) for _ in range(len(imgs))]
     trans = [nn.Parameter(torch.zeros(3, device=device, dtype=dtype)) for _ in range(len(imgs))]
 
-    # initialize
+    # intialize
     ones = torch.ones((len(imgs), 1), device=device, dtype=dtype)
     median_depths = torch.ones(len(imgs), device=device, dtype=dtype)
     for img in imgs:

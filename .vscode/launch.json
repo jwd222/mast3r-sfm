@@ -1,0 +1,73 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "WSL Python Debugger: colmap_from_mast3r with Arguments",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "/mnt/d/projects/mast3r/colmap_from_mast3r.py",
+            "console": "integratedTerminal",
+            "args": [
+                "--image_dir",
+                "/mnt/d/projects/mast3r/data/3/images",
+                "--save_dir",
+                "/mnt/d/projects/mast3r/data/3/colmap",
+                "--model_path",
+                "/mnt/d/projects/mast3r/checkpoints/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric.pth",
+                "--image_size",
+                "512",
+                "--shared_intrinsics"
+            ]
+            // --images_dir /mnt/d/projects/mast3r/data/1/images --save_dir /mnt/d/projects/mast3r/data/1/colmap --model_path /mnt/d/projects/mast3r/checkpoints/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric.pth"
+        },
+        {
+            "name": "Windows Python Debugger: colmap_from_mast3r with Arguments",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "D:\\projects\\wsl_projects\\Projects\\3_repo\\mast3r\\colmap_from_mast3r_ds.py",
+            // D:\projects\wsl_projects\Projects\3_repo\mast3r\colmap_from_mast3r_ds.py
+            "console": "integratedTerminal",
+            "args": [
+                "--image_dir",
+                "D:\\projects\\wsl_projects\\Projects\\3_repo\\mast3r\\data\\7\\images",
+                "--save_dir",
+                "D:\\projects\\wsl_projects\\Projects\\3_repo\\mast3r\\data\\7\\colmap",
+                "--model_path",
+                "D:\\projects\\wsl_projects\\Projects\\3_repo\\mast3r\\checkpoints\\MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric.pth",
+                "--image_size",
+                "512",
+                "--shared_intrinsics"
+            ]
+            // --images_dir /mnt/d/projects/mast3r/data/1/images --save_dir /mnt/d/projects/mast3r/data/1/colmap --model_path /mnt/d/projects/mast3r/checkpoints/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric.pth"
+        },
+        {
+            "name": "WSL Python Debugger: colmap_vis.py with Arguments",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "/mnt/d/projects/mast3r/colmap_vis.py",
+            "console": "integratedTerminal",
+            "args": [
+                "--image_dir",
+                "/mnt/d/projects/mast3r/data/1/colmap/images",
+                "--colmap_path",
+                "/mnt/d/projects/mast3r/data/1/colmap/sparse/0",
+            ]
+        },
+        {
+            "name": "Windows Python Debugger: colmap_vis.py with Arguments",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "D:\\projects\\mast3r\\colmap_vis.py",
+            "console": "integratedTerminal",
+            "args": [
+                "--image_dir",
+                "D:\\projects\\mast3r\\data\\3\\images",
+                "--colmap_path",
+                "D:\\projects\\mast3r\\data\\3\\colmap\\sparse\\0",
+            ]
+        }
+    ]
+}
