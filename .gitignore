@@ -29,6 +29,7 @@ MANIFEST
 .vscode
 checkpoints/
 data/
+tmp_output/
 
 # PyInstaller
 #  Usually these files are written by a python script from a template
