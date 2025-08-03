@@ -26,7 +26,6 @@ share/python-wheels/
 .installed.cfg
 *.egg
 MANIFEST
-.vscode
 checkpoints/
 data/
 tmp_output/

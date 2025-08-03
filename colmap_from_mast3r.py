@@ -428,7 +428,7 @@ def main(image_dir, save_dir, model_path, device, batch_size, image_size, schedu
     # This is the best strategy for the sequential South Building dataset.
     # It creates pairs between an image and its 10 neighbors, runs the matching
     # in both directions for robustness, and avoids any unnecessary filtering.
-    pairs = make_pairs(images, scene_graph='swin-10', prefilter=None, symmetrize=True)
+    pairs = make_pairs(images, scene_graph='swin-5', prefilter=None, symmetrize=True)
 
     cache_dir = os.path.join(save_dir, 'cache')
     if os.path.exists(cache_dir):

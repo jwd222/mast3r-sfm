@@ -89,7 +89,7 @@ def get_reconstructed_scene(glomap_bin, outdir, gradio_delete_cache, model, retr
         imgs = [imgs[0], copy.deepcopy(imgs[0])]
         imgs[1]['idx'] = 1
         filelist = [filelist[0], filelist[0]]
-
+    #Jawad: custom pairs for aerial images where we have a swin type scenegraph
     scene_graph_params = [scenegraph_type]
     if scenegraph_type in ["swin", "logwin"]:
         scene_graph_params.append(str(winsize))
@@ -145,10 +145,16 @@ def get_reconstructed_scene(glomap_bin, outdir, gradio_delete_cache, model, retr
     try:
         kapture_to_colmap(kdata, root_path, tar_handler=None, database=colmap_db,
                           keypoints_type=None, descriptors_type=None, export_two_view_geometry=False)
-        colmap_image_pairs = run_mast3r_matching(model, image_size, 16, device,
-                                                 kdata, root_path, image_pairs, colmap_db,
-                                                 False, 5, 1.001,
-                                                 False, 3)
+        # colmap_image_pairs = run_mast3r_matching(model, image_size, 16, device,
+        #                                          kdata, root_path, image_pairs, colmap_db,
+        #                                          False, 5, 1.001,
+        #                                          False, 3)
+        
+        colmap_image_pairs = run_mast3r_matching(model=model, maxdim=image_size, patch_size=16, device=device,
+                                                 kdata=kdata, root_path=root_path,
+                                                 image_pairs_kapture=image_pairs, colmap_db=colmap_db,
+                                                 dense_matching=True, pixel_tol=5, conf_thr=3,
+                                                 skip_geometric_verification=False, min_len_track=3)
         colmap_db.close()
     except Exception as e:
         print(f'Error {e}')
@@ -165,7 +171,7 @@ def get_reconstructed_scene(glomap_bin, outdir, gradio_delete_cache, model, retr
     for image_path1, image_path2 in colmap_image_pairs:
         f.write("{} {}\n".format(image_path1, image_path2))
     f.close()
-    pycolmap.verify_matches(colmap_db_path, cache_dir + '/pairs.txt')
+    pycolmap.verify_matches(colmap_db_path, cache_dir + '/pairs.txt') #Jawad: why do we verify matches here?
 
     reconstruction_path = os.path.join(cache_dir, "reconstruction")
     if os.path.isdir(reconstruction_path):
@@ -190,8 +196,8 @@ def get_reconstructed_scene(glomap_bin, outdir, gradio_delete_cache, model, retr
     num_reg_images = ouput_recon.num_reg_images()
     for idx, (colmap_imgid, colmap_image) in enumerate(ouput_recon.images.items()):
         colmap_image_id_to_name[colmap_imgid] = colmap_image.name
-        if callable(colmap_image.cam_from_world.matrix):
-            colmap_world_to_cam[colmap_imgid] = colmap_image.cam_from_world.matrix(
+        if callable(colmap_image.cam_from_world):
+            colmap_world_to_cam[colmap_imgid] = colmap_image.cam_from_world().matrix(
             )
         else:
             colmap_world_to_cam[colmap_imgid] = colmap_image.cam_from_world.matrix
@@ -255,9 +261,10 @@ def get_3D_model_from_scene(silent, scene_state, transparent_cams=False, cam_siz
     rot = np.eye(4)
     rot[:3, :3] = Rotation.from_euler('y', np.deg2rad(180)).as_matrix()
     scene.apply_transform(np.linalg.inv(cams2world[0] @ OPENGL @ rot))
-    if not silent:
-        print('(exporting 3D scene to', outfile, ')')
-    scene.export(file_obj=outfile)
+    ## Commented out for not saving .glb file
+    # if not silent:
+    #     print('(exporting 3D scene to', outfile, ')')
+    # scene.export(file_obj=outfile) 
 
     return outfile
 

@@ -35,7 +35,7 @@ def get_cli_args_parser():
                         help='Path to the directory where COLMAP results will be saved.')
     
     # --- Expose arguments that were previously UI elements ---
-    parser.add_argument('--scenegraph_type', type=str, default='complete',
+    parser.add_argument('--scenegraph_type', type=str, default='swin',
                         choices=['complete', 'retrieval', 'swin', 'logwin', 'oneref'],
                         help='Strategy for selecting image pairs for matching.')
     parser.add_argument('--winsize', type=int, default=3,

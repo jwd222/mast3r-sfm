@@ -5,18 +5,52 @@
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "WSL Python Debugger: colmap_from_mast3r with Arguments",
+            "name": "WSL Python Debugger: colmap_from_mast3r_demo.py with Arguments",
             "type": "debugpy",
             "request": "launch",
-            "program": "/mnt/d/projects/mast3r/colmap_from_mast3r.py",
+            "program": "/mnt/d/projects/wsl_projects/Projects/3_repo/mast3r/colmap_from_mast3r_demo.py",
+            "console": "integratedTerminal",
+            "args": [
+                "--input_dir",
+                "/mnt/d/projects/wsl_projects/Projects/3_repo/mast3r/data/tilburg/1/images",
+                "--output_dir",
+                "/mnt/d/projects/wsl_projects/Projects/3_repo/mast3r/data/tilburg/2",
+                "--weights",
+                // "/mnt/d/projects/wsl_projects/Projects/3_repo/aerial-megadepth/mast3r/checkpoints/checkpoint-aerial-mast3r.pth", // mast3r weights
+                "/mnt/d/projects/wsl_projects/Projects/3_repo/aerial-megadepth/mast3r/checkpoints/checkpoint-aerial-dust3r.pth", // dust3r weights
+                // "/mnt/d/projects/wsl_projects/Projects/3_repo/mast3r/checkpoints/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric.pth",
+                "--image_size",
+                "512",
+                "--shared_intrinsics"
+            ]
+        },
+        {
+            "name": "WSL Python Debugger: demo_glomap.py with Arguments",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "/mnt/d/projects/wsl_projects/Projects/3_repo/mast3r/demo_glomap.py",
+            "console": "integratedTerminal",
+            "args": [
+                "--weights",
+                "/mnt/d/projects/wsl_projects/Projects/3_repo/mast3r/checkpoints/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric.pth",
+                "--tmp_dir",
+                "./tmp_output",
+            ]
+            // --images_dir /mnt/d/projects/mast3r/data/1/images --save_dir /mnt/d/projects/mast3r/data/1/colmap --model_path /mnt/d/projects/mast3r/checkpoints/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric.pth"
+        },
+        {
+            "name": "WSL Python Debugger: colmap_from_mast3r.py with Arguments",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "/mnt/d/projects/wsl_projects/Projects/3_repo/mast3r/colmap_from_mast3r.py",
             "console": "integratedTerminal",
             "args": [
                 "--image_dir",
-                "/mnt/d/projects/mast3r/data/3/images",
+                "/mnt/d/projects/wsl_projects/Projects/3_repo/mast3r/data/south-building/1/images",
                 "--save_dir",
-                "/mnt/d/projects/mast3r/data/3/colmap",
+                "/mnt/d/projects/wsl_projects/Projects/3_repo/mast3r/data/south-building/2",
                 "--model_path",
-                "/mnt/d/projects/mast3r/checkpoints/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric.pth",
+                "/mnt/d/projects/wsl_projects/Projects/3_repo/mast3r/checkpoints/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric.pth",
                 "--image_size",
                 "512",
                 "--shared_intrinsics"
