@@ -43,8 +43,6 @@ from tqdm import tqdm
 import cv2
 from dust3r.inference import inference
 
-from chunked_utils import run_chunked_mast3r_matching
-
 
 class GlomapRecon:
     def __init__(self, world_to_cam, intrinsics, points3d, imgs):
@@ -501,80 +499,211 @@ def export_chunked_matches_to_colmap(colmap_db, unique_kpts_per_image, final_mat
 
 
 
-def get_reconstructed_scene_J(glomap_bin, outdir, gradio_delete_cache, model, retrieval_model, device, silent, image_size,
+def get_reconstructed_scene(glomap_bin, outdir, gradio_delete_cache, model, retrieval_model, device, silent, image_size,
                             current_scene_state, filelist, transparent_cams, cam_size, scenegraph_type, winsize,
                             win_cyclic, refid, shared_intrinsics, **kw):
     """
     from a list of images, run mast3r inference, sparse global aligner.
     then run get_3D_model_from_scene
     """
-    cache_dir = os.path.join(outdir, 'cache')
-    # ... inside get_reconstructed_scene ...
+    imgs = load_images(filelist, size=image_size, verbose=not silent)
+    if len(imgs) == 1:
+        imgs = [imgs[0], copy.deepcopy(imgs[0])]
+        imgs[1]['idx'] = 1
+        filelist = [filelist[0], filelist[0]]
+    #Jawad: custom pairs for aerial images where we have a swin type scenegraph
+    scene_graph_params = [scenegraph_type]
+    if scenegraph_type in ["swin", "logwin"]:
+        scene_graph_params.append(str(winsize))
+    elif scenegraph_type == "oneref":
+        scene_graph_params.append(str(refid))
+    elif scenegraph_type == "retrieval":
+        scene_graph_params.append(str(winsize))  # Na
+        scene_graph_params.append(str(refid))  # k
 
-    # (Remove all the old scene_graph and make_pairs logic as discussed)
+    if scenegraph_type in ["swin", "logwin"] and not win_cyclic:
+        scene_graph_params.append('noncyclic')
+    scene_graph = '-'.join(scene_graph_params)
 
-    # 1. Setup paths and load pre-computed transforms
+    sim_matrix = None
+    if 'retrieval' in scenegraph_type:
+        assert retrieval_model is not None
+        retriever = Retriever(retrieval_model, backbone=model, device=device)
+        with torch.no_grad():
+            sim_matrix = retriever(filelist)
+
+        # Cleanup
+        del retriever
+        torch.cuda.empty_cache()
+
+    pairs = make_pairs(imgs, scene_graph=scene_graph, prefilter=None, symmetrize=True, sim_mat=sim_matrix)
+
+    if current_scene_state is not None and \
+        not current_scene_state.should_delete and \
+            current_scene_state.cache_dir is not None:
+        cache_dir = current_scene_state.cache_dir
+    elif gradio_delete_cache:
+        cache_dir = tempfile.mkdtemp(suffix='_cache', dir=outdir)
+    else:
+        cache_dir = os.path.join(outdir, 'cache')
+
     root_path = os.path.commonpath(filelist)
-    TRANSFORMS_JSON_PATH = "/mnt/d/projects/wsl_projects/Projects/3_repo/mast3r/data/tobias/1/fp/image_transforms.json"
-    with open(TRANSFORMS_JSON_PATH, 'r') as f:
-        transform_data_loaded = json.load(f)
-        precomputed_transforms = {
-            tuple(key.split('__')): np.array(value) for key, value in transform_data_loaded.items()
-        }
-
-    # 2. Generate the list of relative and absolute image pairs from the transforms
-    filelist_relpath = [os.path.relpath(f, root_path).replace('\\', '/') for f in filelist]
-    basename_to_relpath_map = {os.path.splitext(os.path.basename(p))[0]: p for p in filelist_relpath}
-    image_pairs_rel = []
-    for name1, name2 in precomputed_transforms.keys():
-        if name1 in basename_to_relpath_map and name2 in basename_to_relpath_map:
-            image_pairs_rel.append((basename_to_relpath_map[name1], basename_to_relpath_map[name2]))
-    image_pairs_abs = [(os.path.join(root_path, p1), os.path.join(root_path, p2)) for p1, p2 in image_pairs_rel]
-
-    # 3. Setup Kapture and COLMAP database
+    filelist_relpath = [
+        os.path.relpath(filename, root_path).replace('\\', '/')
+        for filename in filelist
+    ]
     kdata = kapture_import_image_folder_or_list((root_path, filelist_relpath), shared_intrinsics)
+    image_pairs = [
+        (filelist_relpath[img1['idx']], filelist_relpath[img2['idx']])
+        for img1, img2 in pairs
+    ]
+
     colmap_db_path = os.path.join(cache_dir, 'colmap.db')
-    if os.path.isfile(colmap_db_path): os.remove(colmap_db_path)
+    if os.path.isfile(colmap_db_path):
+        os.remove(colmap_db_path)
+
     os.makedirs(os.path.dirname(colmap_db_path), exist_ok=True)
     colmap_db = COLMAPDatabase.connect(colmap_db_path)
+    
+    # ##########################################################################################################################################
+    # # +++ NEW BLOCK +++
+    # ##########################################################################################################################################
+
+    # # 1. Define cache directory and paths first. This logic is still needed.
+    # if current_scene_state is not None and \
+    #     not current_scene_state.should_delete and \
+    #         current_scene_state.cache_dir is not None:
+    #     cache_dir = current_scene_state.cache_dir
+    # elif gradio_delete_cache:
+    #     cache_dir = tempfile.mkdtemp(suffix='_cache', dir=outdir)
+    # else:
+    #     cache_dir = os.path.join(outdir, 'cache')
+
+    # # 2. Directly compute relative paths from the input filelist.
+    # root_path = os.path.commonpath(filelist)
+    # filelist_relpath = [
+    #     os.path.relpath(filename, root_path).replace('\\', '/')
+    #     for filename in filelist
+    # ]
+
+    # # 3. Load the pre-computed transforms, which now define our pairs.
+    # TRANSFORMS_JSON_PATH = "/mnt/d/projects/wsl_projects/Projects/3_repo/mast3r/data/tobias/1/fp/image_transforms.json"
+    # print(f"Loading pre-computed transforms from {TRANSFORMS_JSON_PATH} to determine matching pairs...")
+    # try:
+    #     with open(TRANSFORMS_JSON_PATH, 'r') as f:
+    #         transform_data_loaded = json.load(f)
+    #         precomputed_transforms = {
+    #             tuple(key.split('__')): np.array(value)
+    #             for key, value in transform_data_loaded.items()
+    #         }
+    #     print(f"Successfully loaded {len(precomputed_transforms)} potential pairs.")
+    # except FileNotFoundError:
+    #     print(f"ERROR: Transform file not found at {TRANSFORMS_JSON_PATH}. Aborting.")
+    #     exit(1)
+
+    # # 4. Generate the `image_pairs` list directly from the keys of the transforms dictionary.
+    # image_pairs = []
+
+    # # Create a quick lookup map from basename -> relative path
+    # basename_to_relpath_map = {
+    #     os.path.splitext(os.path.basename(p))[0]: p 
+    #     for p in filelist_relpath
+    # }
+
+    # for name1_base, name2_base in precomputed_transforms.keys():
+    #     # Find the corresponding relative paths for the basenames in the transform key
+    #     relpath1 = basename_to_relpath_map.get(name1_base)
+    #     relpath2 = basename_to_relpath_map.get(name2_base)
+        
+    #     # Only add the pair if both images are part of the current run (in filelist_relpath)
+    #     if relpath1 and relpath2:
+    #         image_pairs.append((relpath1, relpath2))
+
+    # if not image_pairs:
+    #     raise Exception("No overlapping pairs found based on the transforms JSON and the input filelist.")
+
+    # print(f"Generated {len(image_pairs)} pairs to be matched based on pre-computed overlaps.")
+
+    # # 5. The Kapture and COLMAP DB setup remains the same.
+    # kdata = kapture_import_image_folder_or_list((root_path, filelist_relpath), shared_intrinsics)
+
+    # colmap_db_path = os.path.join(cache_dir, 'colmap.db')
+    # if os.path.isfile(colmap_db_path):
+    #     os.remove(colmap_db_path)
+
+    # os.makedirs(os.path.dirname(colmap_db_path), exist_ok=True)
+    # colmap_db = COLMAPDatabase.connect(colmap_db_path) 
+    # ##########################################################################################################################################
+    # # +++ NEW BLOCK +++
+    # ##########################################################################################################################################
+    
     try:
         kapture_to_colmap(kdata, root_path, tar_handler=None, database=colmap_db,
-                    keypoints_type=None, descriptors_type=None, export_two_view_geometry=False)
+                          keypoints_type=None, descriptors_type=None, export_two_view_geometry=False)
+        # colmap_image_pairs = run_mast3r_matching(model, image_size, 16, device,
+        #                                          kdata, root_path, image_pairs, colmap_db,
+        #                                          False, 5, 1.001,
+        #                                          False, 3)
         
-        # 4. <<<<---- THE MAIN CALL to our new, integrated function ---->>>>
-        indexed_matches = run_chunked_mast3r_matching(
-            model=model,
-            device=device,
-            image_pairs_to_match=image_pairs_abs,
-            root_path=root_path,
-            colmap_db=colmap_db,
-            precomputed_transforms=precomputed_transforms,
-            conf_thr=3.0 # Or pass from UI
-        )
+        colmap_image_pairs = run_mast3r_matching(model=model, maxdim=image_size, patch_size=16, device=device,
+                                                 kdata=kdata, root_path=root_path,
+                                                 image_pairs_kapture=image_pairs, colmap_db=colmap_db,
+                                                 dense_matching=True, pixel_tol=5, conf_thr=3,
+                                                 skip_geometric_verification=False, min_len_track=3)
+        
+
+        # ##########################################################################################################################################
+        # # +++ NEW BLOCK +++
+        # ##########################################################################################################################################
+        # # 1. Get the mapping from image names to the IDs COLMAP has assigned them.
+        # colmap_image_ids = get_colmap_image_ids_from_db(colmap_db)
+
+        # # 2. Prepare the list of absolute image paths for matching.
+        # #    `image_pairs` is a list of relative paths from earlier in the script.
+        # image_pairs_abs = [
+        #     (os.path.join(root_path, p1), os.path.join(root_path, p2))
+        #     for p1, p2 in image_pairs
+        # ]
+
+        # # 3. Run the entire new pipeline, passing the loaded transforms.
+        # unique_kpts, indexed_matches = run_chunked_pipeline(
+        #     image_pairs_to_match=image_pairs_abs,
+        #     model=model,
+        #     device=device,
+        #     precomputed_transforms=precomputed_transforms,  # Pass the loaded dictionary here
+        #     tile_size=(1024, 1024),
+        #     overlap_px=256
+        # )
+
+        # # 4. Export the final, clean results to the COLMAP database.
+        # export_chunked_matches_to_colmap(colmap_db, unique_kpts, indexed_matches, colmap_image_ids)
+
+        # ##########################################################################################################################################
+        # # +++ NEW BLOCK +++
+        # ##########################################################################################################################################
+
         colmap_db.close()
+
     except Exception as e:
-        print(f'Error during chunked matching: {e}')
+        print(f'Error {e}')
         colmap_db.close()
         exit(1)
+        
+    if len(colmap_image_pairs) == 0:
+        raise Exception("no matches were kept")
 
-    if not indexed_matches:
-        raise Exception("Chunked matching resulted in no valid matches.")
+    # if len(indexed_matches) == 0:
+    #     raise Exception("Chunked matching resulted in no matches.")
 
-    # 5. Create pairs.txt for pycolmap verification
-    #    (The rest of the pipeline continues from here as planned)
+    # colmap db is now full, run colmap
+    colmap_world_to_cam = {}
     print("verify_matches")
     f = open(cache_dir + '/pairs.txt', "w")
-    for rel_path1, rel_path2 in image_pairs_rel:
-        abs_path1 = os.path.join(root_path, rel_path1)
-        abs_path2 = os.path.join(root_path, rel_path2)
-        # Check if a match exists for this pair
-        if (abs_path1, abs_path2) in indexed_matches and len(indexed_matches[(abs_path1, abs_path2)]) > 15:
-            f.write(f"{rel_path1} {rel_path2}\n")
+    for image_path1, image_path2 in colmap_image_pairs:
+    # for image_path1, image_path2 in image_pairs:
+        f.write("{} {}\n".format(image_path1, image_path2))
     f.close()
-
-    pycolmap.verify_matches(colmap_db_path, cache_dir + '/pairs.txt')
-
-    # ... the rest of your get_reconstructed_scene function proceeds as normal ...
+    pycolmap.verify_matches(colmap_db_path, cache_dir + '/pairs.txt') #Jawad: why do we verify matches here?
 
     reconstruction_path = os.path.join(cache_dir, "reconstruction")
     if os.path.isdir(reconstruction_path):

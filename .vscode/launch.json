@@ -12,9 +12,9 @@
             "console": "integratedTerminal",
             "args": [
                 "--input_dir",
-                "/mnt/d/projects/wsl_projects/Projects/3_repo/mast3r/data/tilburg/1/images",
+                "/mnt/d/projects/wsl_projects/Projects/3_repo/mast3r/data/tobias/1/images",
                 "--output_dir",
-                "/mnt/d/projects/wsl_projects/Projects/3_repo/mast3r/data/tilburg/2",
+                "/mnt/d/projects/wsl_projects/Projects/3_repo/mast3r/data/tobias/1",
                 "--weights",
                 // "/mnt/d/projects/wsl_projects/Projects/3_repo/aerial-megadepth/mast3r/checkpoints/checkpoint-aerial-mast3r.pth", // mast3r weights
                 "/mnt/d/projects/wsl_projects/Projects/3_repo/aerial-megadepth/mast3r/checkpoints/checkpoint-aerial-dust3r.pth", // dust3r weights
@@ -36,7 +36,6 @@
                 "--tmp_dir",
                 "./tmp_output",
             ]
-            // --images_dir /mnt/d/projects/mast3r/data/1/images --save_dir /mnt/d/projects/mast3r/data/1/colmap --model_path /mnt/d/projects/mast3r/checkpoints/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric.pth"
         },
         {
             "name": "WSL Python Debugger: colmap_from_mast3r.py with Arguments",

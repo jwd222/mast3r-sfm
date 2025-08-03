@@ -122,13 +122,13 @@ def main(footprints_path, image_dir, output_path, image_id_col='image_id'):
             # We save the numpy array as a list of lists for JSON serialization
             transforms[f"{name_A}__{name_B}"] = transform_A_to_B.tolist()
 
-        # # It's also useful to pre-calculate the inverse transform B -> A
-        # transform_B_to_A = calculate_transform_between_images(
-        #     data_B['path'], data_B['geometry'],
-        #     data_A['path'], data_A['geometry']
-        # )
-        # if transform_B_to_A is not None:
-        #     transforms[f"{name_B}__{name_A}"] = transform_B_to_A.tolist()
+        # It's also useful to pre-calculate the inverse transform B -> A
+        transform_B_to_A = calculate_transform_between_images(
+            data_B['path'], data_B['geometry'],
+            data_A['path'], data_A['geometry']
+        )
+        if transform_B_to_A is not None:
+            transforms[f"{name_B}__{name_A}"] = transform_B_to_A.tolist()
             
     print(f"\nCalculated {len(transforms)} pairwise transformations.")
     
@@ -145,7 +145,7 @@ if __name__ == '__main__':
     # Directory where your .tif files are stored
     IMG_DIR = "/mnt/d/projects/wsl_projects/Projects/3_repo/mast3r/data/tobias/1/images"
     # The output file that will store the results
-    OUTPUT_JSON = "/mnt/d/projects/wsl_projects/Projects/3_repo/mast3r/data/tobias/1/fp/image_transforms_one_way_tobias.json"
+    OUTPUT_JSON = "/mnt/d/projects/wsl_projects/Projects/3_repo/mast3r/data/tobias/1/fp/image_transforms.json"
     # The column name in your footprints file that holds the image filename (e.g., 'IMG_001.tif')
     IMAGE_ID_COLUMN = "id" 
 

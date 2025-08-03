@@ -16,7 +16,7 @@ from pathlib import Path
 
 # --- Important: Make sure the mast3r library is in the Python path
 # This is usually handled by your environment setup.
-from mast3r.demo_glomap import get_reconstructed_scene, get_args_parser as get_demo_args_parser
+from mast3r.demo_glomap import get_args_parser as get_demo_args_parser, get_reconstructed_scene_J
 from mast3r.model import AsymmetricMASt3R
 from dust3r.demo import set_print_with_timestamp
 
@@ -77,7 +77,7 @@ def main():
     cache_dir.mkdir(parents=True, exist_ok=True)
     
     # Find all image files in the input directory
-    image_extensions = ['.jpg', '.jpeg', '.png', '.bmp', '.tiff']
+    image_extensions = ['.jpg', '.jpeg', '.png', '.bmp', '.tif', '.tiff']
     filelist = sorted([str(p) for p in input_dir.iterdir() if p.suffix.lower() in image_extensions])
 
     if len(filelist) < 2:
@@ -101,7 +101,7 @@ def main():
     print("\nStarting reconstruction process...")
     try:
         # This is the core function from the original script
-        scene_state, _ = get_reconstructed_scene(
+        scene_state, _ = get_reconstructed_scene_J(
             glomap_bin=args.glomap_bin,
             outdir=str(cache_dir),
             gradio_delete_cache=False,  # Ensure cache is not deleted
