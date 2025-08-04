@@ -14,7 +14,7 @@ from torchvision import transforms
 
 # You will need these helper functions from the original mast3r repository's utils.
 # Make sure they are available in your Python path.
-from dust3r.utils.geometry import xy_grid
+from dust3r.utils.geometry import find_reciprocal_matches, xy_grid, geotrf  # noqa
 from mast3r.fast_nn import bruteforce_reciprocal_nns
 from kapture.converter.colmap.database_extra import kapture_to_colmap, get_colmap_image_ids_from_db
 from dust3r.inference import inference
@@ -33,55 +33,66 @@ except ImportError:
     ])
 
 
-def extract_matches_from_tile_prediction(pred1, pred2, conf_thr=3.0, device='cuda'):
+def extract_matches_from_tile_prediction(pred1, pred2, shape1, shape2, conf_thr=3.0, device='cuda'):
     """
-    ADAPTED from the core logic of `get_im_matches`.
-    This function takes the raw output of the MASt3R model for a SINGLE tile pair
+    CORRECTED VERSION.
+    This function takes the raw output of the DUSt3R model for a SINGLE tile pair
     and extracts the 2D-2D point correspondences in their local tile coordinates.
+    It uses the 'pts3d' and 'conf' keys.
 
     Args:
         pred1 (dict): The model's prediction for the first tile.
         pred2 (dict): The model's prediction for the second tile.
+        shape1 (torch.Size): The (H, W) shape of the first tile tensor.
+        shape2 (torch.Size): The (H, W) shape of the second tile tensor.
         conf_thr (float): The confidence threshold to filter keypoints.
         device (str): The device to use for calculations.
 
     Returns:
-        tuple: A tuple containing (matches_im0, matches_im1), where each is a
-               numpy array of shape (N, 2) with keypoint coordinates local to their tile.
-               Returns (None, None) if no matches are found.
+        tuple: A tuple containing (matches_im0, matches_im1), numpy arrays of
+               shape (N, 2) with keypoint coordinates local to their tile.
     """
-    # This logic is for dense matching using descriptors, copied from get_im_matches
-    descs = [pred1['desc'], pred2['desc']]
-    confidences = [pred1['desc_conf'], pred2['desc_conf']]
-    desc_dim = descs[0].shape[-1]
-    
-    confidence_masks = [confidences[0] >= conf_thr, confidences[1] >= conf_thr]
-    
-    pts2d_list, desc_list = [], []
+    # This logic is for dense matching using 3D point clouds, adapted from get_im_matches
+    pts3d_list_raw = [pred1['pts3d'], pred2['pts3d_in_other_view']]
+    confidences = [pred1['conf'], pred2['conf']]
+    shapes = [shape1, shape2]
+
+    # Create confidence masks
+    confidence_masks = [conf >= conf_thr for conf in confidences]
+
+    # Find 2D-2D matches between the two images by matching their 3D point clouds
+    pts2d_list, pts3d_list = [], []
     for j in range(2):
-        # Get shape directly from the descriptor tensor: (1, H, W, C) -> (H, W)
-        true_shape_j = descs[j].shape[1:3]
-        
+        # Flatten the confidence mask
         conf_j = confidence_masks[j].cpu().numpy().flatten()
-        pts2d_j = xy_grid(true_shape_j[1], true_shape_j[0]).reshape(-1, 2)[conf_j]
-        desc_j = descs[j].detach().cpu().numpy().reshape(-1, desc_dim)[conf_j]
         
-        pts2d_list.append(pts2d_j)
-        desc_list.append(desc_j)
+        # Get the H, W shape for the current view
+        true_shape_j = shapes[j]
         
-    if len(desc_list[0]) == 0 or len(desc_list[1]) == 0:
+        # Create a grid of all possible 2D coordinates
+        pts2d_j = xy_grid(true_shape_j[1], true_shape_j[0]).reshape(-1, 2)
+        
+        # Filter the 2D points and 3D points based on confidence
+        pts2d_j_filtered = pts2d_j[conf_j]
+        pts3d_j_filtered = pts3d_list_raw[j].detach().cpu().numpy().reshape(-1, 3)[conf_j]
+        
+        pts2d_list.append(pts2d_j_filtered)
+        pts3d_list.append(pts3d_j_filtered)
+
+    # Use the filtered 3D points to find matches
+    PQ, PM = pts3d_list[0], pts3d_list[1]
+    if len(PQ) == 0 or len(PM) == 0:
+        return None, None
+        
+    # Find reciprocal nearest neighbors in the 3D point clouds
+    reciprocal_in_PM, nnM_in_PQ, num_matches = find_reciprocal_matches(PQ, PM)
+
+    if num_matches == 0:
         return None, None
 
-    # Use the existing reciprocal nearest neighbor matching function
-    nn0, nn1 = bruteforce_reciprocal_nns(
-        desc_list[0], desc_list[1],
-        device=device, dist='dot', block_size=2**13
-    )
-    reciprocal_in_P0 = (nn1[nn0] == np.arange(len(nn0)))
-
-    # Get the final matched coordinates in their respective local tile spaces
-    matches_im1 = pts2d_list[1][nn0][reciprocal_in_P0]
-    matches_im0 = pts2d_list[0][reciprocal_in_P0]
+    # Use the indices from the 3D match to get the final 2D coordinates
+    matches_im1 = pts2d_list[1][reciprocal_in_PM]
+    matches_im0 = pts2d_list[0][nnM_in_PQ][reciprocal_in_PM]
 
     return matches_im0, matches_im1
 
@@ -149,7 +160,7 @@ def deduplicate_and_format_for_colmap(aggregated_matches, distance_threshold=2.0
 def run_chunked_mast3r_matching(
     model, device, image_pairs_to_match, root_path, colmap_db,
     precomputed_transforms,
-    tile_size=(1024, 1024), overlap_px=256, conf_thr=3.0):
+    tile_size=(512, 512), overlap_px=128, conf_thr=3.0):
     """
     The COMPLETE REPLACEMENT for the original `run_mast3r_matching` function.
     It orchestrates the tiling, matching, aggregation, and database export.
@@ -161,11 +172,11 @@ def run_chunked_mast3r_matching(
     
     for image_path in tqdm(all_image_paths_abs, total=len(all_image_paths_abs), desc="Preparing tiles"):
         if image_path not in tile_cache:
-            tile_cache[image_path] = generate_image_tiles(image_path, tile_size, overlap_px)
+            tile_cache[image_path] = generate_image_tiles(image_path, tile_size, overlap_px, save_tile_data=True)
 
     # --- Part B: Inference on Tile Pairs and Match Aggregation ---
     aggregated_matches = {}
-    batch_size = 4 # Adjust based on GPU memory
+    batch_size = 2 # Adjust based on GPU memory
 
     print("Beginning chunked feature matching...")
     for image_path1, image_path2 in tqdm(image_pairs_to_match, desc="Processing Image Pairs"):
@@ -183,7 +194,7 @@ def run_chunked_mast3r_matching(
         if not overlapping_tile_pairs: continue
 
         # Process all tile pairs for this image pair in batches
-        for i in range(0, len(overlapping_tile_pairs), batch_size):
+        for i in tqdm(range(0, len(overlapping_tile_pairs), batch_size), desc="Matching Tile Pairs", leave=False, total=len(overlapping_tile_pairs)):
             batch_of_pairs = overlapping_tile_pairs[i:i + batch_size]
             
             # Create a LIST of TUPLES in the exact format `inference` expects.
@@ -242,15 +253,31 @@ def run_chunked_mast3r_matching(
                 pred1_single = {key: val[j] for key, val in output['pred1'].items()}
                 pred2_single = {key: val[j] for key, val in output['pred2'].items()}
                 
-                kpts1_local, kpts2_local = extract_matches_from_tile_prediction(pred1_single, pred2_single, conf_thr, device)
+                #
+                # --- THIS IS THE UPDATED FUNCTION CALL ---
+                # We now pass the tensor shapes to the extraction function.
+                #
+                # We also need the tensor that was created *before* the unsqueeze(0)
+                img_a_tensor = ImgNorm(tile_a['tile_data'])
+                img_b_tensor = ImgNorm(tile_b['tile_data'])
+
+                kpts1_local, kpts2_local = extract_matches_from_tile_prediction(
+                    pred1_single,
+                    pred2_single,
+                    img_a_tensor.shape[-2:],  # Pass the (H, W) shape
+                    img_b_tensor.shape[-2:],  # Pass the (H, W) shape
+                    conf_thr,
+                    device
+                )
 
                 if kpts1_local is None: continue
 
+                # The rest of the re-projection logic remains the same
                 offset_a = tile_a["bounds_in_parent"][:2]
                 offset_b = tile_b["bounds_in_parent"][:2]
                 kpts1_global = kpts1_local + offset_a
                 kpts2_global = kpts2_local + offset_b
-
+                
                 pair_key = (image_path1, image_path2)
                 if pair_key not in aggregated_matches:
                     aggregated_matches[pair_key] = {"kpts0": [], "kpts1": []}
@@ -297,39 +324,37 @@ def run_chunked_mast3r_matching(
 
     return indexed_matches
 
-def generate_image_tiles(image_path, tile_size=(1024, 1024), overlap_px=256):
+Image.MAX_IMAGE_PIXELS = None
+
+def generate_image_tiles(image_path, tile_size=(512, 512), overlap_px=128, save_tile_data=False):
     """
-    Divides a large image into smaller, overlapping tiles.
+    MODIFIED VERSION.
+    Divides a large image into smaller, overlapping tiles. If a tile at the edge
+    is smaller than `tile_size`, it is padded with black pixels to ensure all
+    output tiles have uniform dimensions.
 
     Args:
         image_path (str): The file path to the high-resolution image.
-        tile_size (tuple): The (width, height) of the tiles to generate. This should
-                           be a size that MASt3R can handle well.
+        tile_size (tuple): The (width, height) of the tiles to generate. This
+                           dimension MUST be divisible by the model's patch size (e.g., 16).
         overlap_px (int): The number of pixels of overlap between adjacent tiles.
-                          This is crucial to ensure features on tile borders are
-                          captured in at least one full tile context.
 
     Returns:
-        list: A list of dictionaries, where each dictionary represents a tile.
-              It contains the tile's ID, its parent image, its pixel bounds
-              within the parent image, and the image data as a NumPy array.
-              Returns an empty list if the image cannot be opened.
+        list: A list of dictionaries for each tile, guaranteed to have uniform size.
     """
     try:
-        # Open the high-resolution source image
-        img = Image.open(image_path)
+        img = Image.open(image_path).convert('RGB')
         img_w, img_h = img.size
     except Exception as e:
         print(f"ERROR: Could not open image {image_path}. Reason: {e}")
         return []
 
     tiles_manifest = []
-    tile_w, tile_h = tile_size
+    target_w, target_h = tile_size
     
     # The stride is the distance to move for the start of the next tile.
-    # If tile_w is 1024 and overlap is 256, the next tile starts 768 pixels over.
-    stride_w = tile_w - overlap_px
-    stride_h = tile_h - overlap_px
+    stride_w = target_w - overlap_px
+    stride_h = target_h - overlap_px
     
     tile_id_counter = 0
 
@@ -337,32 +362,64 @@ def generate_image_tiles(image_path, tile_size=(1024, 1024), overlap_px=256):
     for y in range(0, img_h, stride_h):
         for x in range(0, img_w, stride_w):
             # Define the bounding box for cropping the tile from the source image.
-            # The coordinates are (left, upper, right, lower).
-            x_end = min(x + tile_w, img_w)
-            y_end = min(y + tile_h, img_h)
+            x_end = min(x + target_w, img_w)
+            y_end = min(y + target_h, img_h)
             
-            # Crop the tile from the main image
+            # Crop the tile. This tile might be smaller than tile_size at the edges.
             tile_img = img.crop((x, y, x_end, y_end))
 
-            # Discard tiles that are too small (e.g., thin slivers at the edges)
-            # which won't be useful for feature matching.
+            # Optional: Discard tiles that are too small to be useful (e.g., thin slivers)
             if tile_img.width < overlap_px or tile_img.height < overlap_px:
                 continue
 
-            # This dictionary holds all the critical info about the tile
+            #
+            # --- START: NEW PADDING LOGIC ---
+            #
+            final_tile = tile_img
+            # Check if the cropped tile's dimensions are smaller than the target.
+            if tile_img.size != tile_size:
+                # Create a new, black canvas of the target size.
+                final_tile = Image.new('RGB', tile_size, (0, 0, 0))
+                # Paste the smaller, cropped tile onto the canvas at the top-left corner.
+                # The remaining area will be black padding.
+                final_tile.paste(tile_img, (0, 0))
+            #
+            # --- END: NEW PADDING LOGIC ---
+            #
+            
+            # #####debug:
+            # if f"{os.path.basename(image_path)}_tile_{tile_id_counter:04d}" == '138001372_0021_01_0031_P00_01.tif_tile_0011':
+            #     pass
+            
+            # Assert the tile size is exactly as expected
+            assert final_tile.size == tile_size, f"Tile size mismatch: got {final_tile.size}, expected {tile_size}"
+
             tile_info = {
                 "tile_id": f"{os.path.basename(image_path)}_tile_{tile_id_counter:04d}",
                 "parent_image_path": image_path,
-                # CRITICAL: Store the tile's position relative to the original image.
-                # Format is (x_min, y_min, x_max, y_max).
+                # The bounds still refer to the *original* crop area, which is correct.
                 "bounds_in_parent": (x, y, x_end, y_end),
-                # The actual image data as a NumPy array, ready for the model.
-                "tile_data": np.array(tile_img)
+                # The tile_data is now ALWAYS the target size (e.g., 512x512).
+                "tile_data": np.array(final_tile)
             }
             tiles_manifest.append(tile_info)
             tile_id_counter += 1
             
+    # Save json in case we want to use it later            
+    # Prepare a lightweight version for JSON
+    if save_tile_data:
+        tiles_manifest_json = [
+            {
+                k: v for k, v in tile.items() if k != "tile_data"
+            }
+            for tile in tiles_manifest
+        ]
+
+        # Now safe to dump
+        json.dump(tiles_manifest_json, open(f"{image_path}_tiles_manifest.json", 'w'), indent=4)
+                        
     return tiles_manifest
+
 
 def _check_bbox_intersection(boxA, boxB):
     """Helper function to check if two bounding boxes intersect."""
