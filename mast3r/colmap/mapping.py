@@ -137,7 +137,7 @@ def pycolmap_run_mapper(colmap_db_path, recon_path, image_root_path):
     )
 
 
-def glomap_run_mapper(glomap_bin, colmap_db_path, recon_path, image_root_path):
+def _glomap_run_mapper(glomap_bin, colmap_db_path, recon_path, image_root_path):
     print("running mapping")
     args = [
         'mapper',
@@ -156,6 +156,63 @@ def glomap_run_mapper(glomap_bin, colmap_db_path, recon_path, image_root_path):
         raise ValueError(
             '\nSubprocess Error (Return code:'
             f' {glomap_process.returncode} )')
+        
+def glomap_run_mapper(glomap_bin, colmap_db_path, recon_path, image_root_path, options=None):
+    """
+    MODIFIED VERSION.
+    Runs the GLOMAP mapper with added flexibility to pass custom options.
+
+    Args:
+        glomap_bin (str): Path to the GLOMAP executable.
+        colmap_db_path (str): Path to the COLMAP database.
+        recon_path (str): Path to the desired output reconstruction directory.
+        image_root_path (str): Path to the root directory of the images.
+        options (dict, optional): A dictionary of additional command-line options
+                                  to pass to GLOMAP, e.g.,
+                                  {"--TrackEstablishment.min_track_length": "2"}.
+                                  Defaults to None.
+    """
+    print("running mapping with custom options...")
+    
+    # --- Base arguments required for any run ---
+    args = [
+        glomap_bin,
+        'mapper',
+        '--database_path',
+        colmap_db_path,
+        '--image_path',
+        image_root_path,
+        '--output_path',
+        recon_path
+    ]
+
+    # --- Append the custom options ---
+    # The `options` dictionary allows for flexible configuration.
+    if options:
+        for option, value in options.items():
+            args.append(option)
+            if value is not None and str(value) != "":
+                args.append(str(value))
+    
+    print(f"Executing GLOMAP with command: {' '.join(args)}")
+
+    # --- Run the subprocess ---
+    glomap_process = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+
+    # Print output in real-time
+    while True:
+        output = glomap_process.stdout.readline()
+        if output == '' and glomap_process.poll() is not None:
+            break
+        if output:
+            print(output.strip())
+            
+    return_code = glomap_process.poll()
+
+    if return_code != 0:
+        raise ValueError(
+            f'\nGLOMAP Subprocess Error (Return code: {return_code})'
+        )
 
 
 def kapture_import_image_folder_or_list(images_path: Union[str, Tuple[str, List[str]]], use_single_camera=False) -> kapture.Kapture:

@@ -574,14 +574,45 @@ def get_reconstructed_scene_J(glomap_bin, outdir, gradio_delete_cache, model, re
 
     pycolmap.verify_matches(colmap_db_path, cache_dir + '/pairs.txt')
 
-    # ... the rest of your get_reconstructed_scene function proceeds as normal ...
-
     reconstruction_path = os.path.join(cache_dir, "reconstruction")
     if os.path.isdir(reconstruction_path):
         shutil.rmtree(reconstruction_path)
     os.makedirs(reconstruction_path, exist_ok=True)
-    glomap_run_mapper(glomap_bin, colmap_db_path, reconstruction_path, root_path)
+    
+    #
+    # --- START: NEW GLOMAP CONFIGURATION AND CALL ---
+    #
+    
+    # Define the custom options we need to pass to GLOMAP.
+    # This is the core of the fix.
+    glomap_options = {
+        # This allows tracks of length 2, which we already have.
+        "--TrackEstablishment.min_num_view_per_track": "2",
+        
+        # This makes geometric verification more tolerant for high-res images.
+        "--RelPoseEstimation.max_epipolar_error": "8",
 
+        #
+        # --- THIS IS THE NEW, CRITICAL FIX ---
+        #
+        # Lower the minimum required triangulation angle from the default of 1.0
+        # to a much smaller value suitable for aerial imagery with low parallax.
+        # A value of 0.1 is a good starting point.
+        "--Triangulation.min_angle": "0.0001"
+    }
+
+    # Call the modified function with the new options.
+    glomap_run_mapper(
+        glomap_bin=glomap_bin,
+        colmap_db_path=colmap_db_path,
+        recon_path=reconstruction_path,
+        image_root_path=root_path,
+        options=glomap_options
+    )
+
+    # --- END: NEW GLOMAP CONFIGURATION AND CALL ---
+    #
+    
     if current_scene_state is not None and \
         not current_scene_state.should_delete and \
             current_scene_state.outfile_name is not None:
