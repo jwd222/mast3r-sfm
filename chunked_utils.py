@@ -330,29 +330,69 @@ def run_chunked_mast3r_matching(
     
     for image_path in tqdm(all_image_paths_abs, total=len(all_image_paths_abs), desc="Preparing tiles"):
         if image_path not in tile_cache:
-            tile_cache[image_path] = generate_image_tiles(image_path, tile_size, overlap_px, save_tile_data=True)
+            tile_cache[image_path] = generate_image_tiles(image_path, tile_size, overlap_px, save_tile_data=False)
 
     # --- Part B: Inference on Tile Pairs and Match Aggregation ---
     aggregated_matches_temp = {} # Use a temporary dictionary
     batch_size = 2 # Adjust based on GPU memory
+    
+    # --- START: NEW CACHING LOGIC ---
+    # This cache will store the computed tile pairs to avoid redundant work.
+    tile_pair_cache = {}
+    # --- END: NEW CACHING LOGIC ---
+
 
     print("Beginning chunked feature matching...")
     for image_path1, image_path2 in tqdm(image_pairs_to_match, desc="Processing Image Pairs"):
-        # Get basenames for transform lookup
-        name1_base = os.path.splitext(os.path.basename(image_path1))[0]
-        name2_base = os.path.splitext(os.path.basename(image_path2))[0]
-        transform_1_to_2 = precomputed_transforms.get((name1_base, name2_base))
         
-        if transform_1_to_2 is None: continue
+        # --- START: NEW CACHING LOGIC ---
+        # Create a canonical (sorted) key to represent the pair regardless of order.
+        canonical_key = tuple(sorted((image_path1, image_path2)))
+        
+        if canonical_key in tile_pair_cache:
+            # If we've already computed pairs for this combination, retrieve them.
+            cached_pairs = tile_pair_cache[canonical_key]
+            # Check if the current order is the same as the cached order.
+            if image_path1 == canonical_key[0]:
+                # Order is the same, use as is.
+                overlapping_tile_pairs = cached_pairs
+            else:
+                # Order is swapped, so we must swap the elements in each pair tuple.
+                overlapping_tile_pairs = [(b, a) for a, b in cached_pairs]
+        else:
+            # This is a new pair, we need to compute the overlaps.
+            name1_base = os.path.splitext(os.path.basename(image_path1))[0]
+            name2_base = os.path.splitext(os.path.basename(image_path2))[0]
+            transform_1_to_2 = precomputed_transforms.get((name1_base, name2_base))
 
-        tiles1 = tile_cache[image_path1]
-        tiles2 = tile_cache[image_path2]
-        
-        overlapping_tile_pairs = determine_overlapping_tile_pairs(tiles1, tiles2, transform_1_to_2)
+            # Important: Get inverse transform for symmetric calculation if needed.
+            # This part assumes transform for B->A might not be in the precomputed file.
+            if transform_1_to_2 is None:
+                transform_2_to_1 = precomputed_transforms.get((name2_base, name1_base))
+                if transform_2_to_1 is not None:
+                    # Invert the B->A transform to get A->B
+                    M_inv = cv2.invertAffineTransform(transform_2_to_1)
+                    transform_1_to_2 = M_inv
+                else:
+                    continue # Skip if no transform is found
+
+            tiles1 = tile_cache[image_path1]
+            tiles2 = tile_cache[image_path2]
+            
+            # Compute the tile pairs using our new one-to-one function.
+            overlapping_tile_pairs = determine_overlapping_tile_pairs(tiles1, tiles2, transform_1_to_2)
+            
+            # Store the result in the cache under the canonical key.
+            # We must check the canonical order to store it correctly.
+            if image_path1 == canonical_key[0]:
+                tile_pair_cache[canonical_key] = overlapping_tile_pairs
+            else:
+                tile_pair_cache[canonical_key] = [(b, a) for a, b in overlapping_tile_pairs]
+                
         if not overlapping_tile_pairs: continue
 
         # Process all tile pairs for this image pair in batches
-        for i in tqdm(range(0, len(overlapping_tile_pairs), batch_size), desc="Matching Tile Pairs", total=len(overlapping_tile_pairs)):
+        for i in tqdm(range(0, len(overlapping_tile_pairs), batch_size), desc="Matching Tile Pairs", total=len(overlapping_tile_pairs), leave=False):
             batch_of_pairs = overlapping_tile_pairs[i:i + batch_size]
             
             # Create a LIST of TUPLES in the exact format `inference` expects.
@@ -408,8 +448,15 @@ def run_chunked_mast3r_matching(
             # Extract, re-project, and aggregate matches for each result in the batch
             for j, (tile_a, tile_b) in enumerate(batch_of_pairs):
                 # We need to index into the batched prediction tensors
-                pred1_single = {key: val[j] for key, val in output['pred1'].items()}
-                pred2_single = {key: val[j] for key, val in output['pred2'].items()}
+                # write this in detail `pred1_single = {key: val[j] for key, val in output['pred1'].items()}`
+                pred1_single = {}
+                for key, val in output['pred1'].items():
+                    pred1_single[key] = val[j]     
+                                       
+                # pred2_single = {key: val[j] for key, val in output['pred2'].items()}
+                pred2_single = {}
+                for key, val in output['pred2'].items():
+                    pred2_single[key] = val[j]     
                 
                 #
                 # --- THIS IS THE UPDATED FUNCTION CALL ---
@@ -460,10 +507,10 @@ def run_chunked_mast3r_matching(
             "kpts1": final_kpts1
         }
         
-    # save the aggregated_matches_final for debugging or further processing
-    torch.save(aggregated_matches_final, os.path.join(root_path, "aggregated_matches_final.pt"))
+    # # save the aggregated_matches_final for debugging or further processing
+    # torch.save(aggregated_matches_final, os.path.join(root_path, "aggregated_matches_final.pt"))
     # --- END: NEW FINALIZATION STEP (THE FIX) ---
-    
+    # torch.save(aggregated_matches_final, os.path.join(root_path, "aggregated_matches_final.pt"))
     # --- Part C: Deduplicate and Export ---
     unique_kpts, indexed_matches = deduplicate_and_format_for_colmap(aggregated_matches_final, min_len_track=2)
     
@@ -599,18 +646,18 @@ def generate_image_tiles(image_path, tile_size=(512, 512), overlap_px=128, save_
             tiles_manifest.append(tile_info)
             tile_id_counter += 1
             
-    # # Save json in case we want to use it later            
-    # # Prepare a lightweight version for JSON
-    # if save_tile_data:
-    #     tiles_manifest_json = [
-    #         {
-    #             k: v for k, v in tile.items() if k != "tile_data"
-    #         }
-    #         for tile in tiles_manifest
-    #     ]
+    # Save json in case we want to use it later            
+    # Prepare a lightweight version for JSON
+    if save_tile_data:
+        tiles_manifest_json = [
+            {
+                k: v for k, v in tile.items() if k != "tile_data"
+            }
+            for tile in tiles_manifest
+        ]
 
-    #     # Now safe to dump
-    #     json.dump(tiles_manifest_json, open(f"{image_path}_tiles_manifest.json", 'w'), indent=4)
+        # Now safe to dump
+        json.dump(tiles_manifest_json, open(f"{image_path}_tiles_manifest.json", 'w'), indent=4)
                         
     return tiles_manifest
 
@@ -637,26 +684,22 @@ def _calculate_intersection_area(boxA, boxB):
     Returns:
         float: The area of the intersection. Returns 0 if they do not intersect.
     """
-    # Determine the coordinates of the intersection rectangle
     x_left = max(boxA[0], boxB[0])
     y_top = max(boxA[1], boxB[1])
     x_right = min(boxA[2], boxB[2])
     y_bottom = min(boxA[3], boxB[3])
 
-    # If the boxes do not overlap, the area is 0
     if x_right < x_left or y_bottom < y_top:
         return 0.0
-
-    # The area is the product of the intersection's width and height
-    intersection_area = (x_right - x_left) * (y_bottom - y_top)
-    return intersection_area
+    return (x_right - x_left) * (y_bottom - y_top)
 
 
 def determine_overlapping_tile_pairs(tiles_A, tiles_B, transform_A_to_B):
     """
-    MODIFIED VERSION (One-to-One Best Match).
-    Identifies the single best-matching tile in Image B for each tile in Image A,
-    based on the largest intersection area.
+    MODIFIED VERSION (True One-to-One Best Match).
+    1. For each tile in A, finds the single best-matching tile in B by area.
+    2. If multiple tiles in A claim the same tile in B, it resolves the conflict,
+       keeping only the pairing with the largest overlap area.
 
     Args:
         tiles_A (list): The tile manifest for the source image A.
@@ -664,52 +707,48 @@ def determine_overlapping_tile_pairs(tiles_A, tiles_B, transform_A_to_B):
         transform_A_to_B (np.ndarray): The 2x3 affine transformation matrix.
 
     Returns:
-        list: A list of one-to-one tile pair tuples, e.g., [(tile_A1, tile_B3), ...].
+        list: A list of true one-to-one tile pair tuples.
     """
     if transform_A_to_B is None or not tiles_A or not tiles_B:
         return []
 
-    overlapping_pairs = []
-
-    # Iterate through each tile in the source image A
+    # --- Pass 1: For each tile in A, find its best candidate in B ---
+    candidate_pairs = []
     for tile_a in tiles_A:
-        # --- Find the single best match in B for this specific tile_a ---
         best_match_tile_b = None
         max_area = 0.0
 
-        # Project tile_a's bounding box into image B's coordinate system
         x_min, y_min, x_max, y_max = tile_a["bounds_in_parent"]
-
-        # Define the four corners of the bounding box to be transformed.
-        # The shape must be (1, N, 2) for cv2.transform.
-        corners_a = np.array([
-            [[x_min, y_min]],
-            [[x_max, y_min]],
-            [[x_max, y_max]],
-            [[x_min, y_max]]
-        ], dtype=np.float32)
-
-        # Project the corners of tile A's bounding box into image B's coordinate system.
+        corners_a = np.array([[[x_min, y_min]], [[x_max, y_min]], [[x_max, y_max]], [[x_min, y_max]]], dtype=np.float32)
         transformed_corners = cv2.transform(corners_a, transform_A_to_B)
         
-        # Create a new bounding box in image B that encloses the projected shape.
-        x_coords = transformed_corners[:, 0, 0]
-        y_coords = transformed_corners[:, 0, 1]
-        projected_bbox_in_B = [np.min(x_coords), np.min(y_coords), np.max(x_coords), np.max(y_coords)]
+        projected_bbox_in_B = [np.min(transformed_corners[:,:,0]), np.min(transformed_corners[:,:,1]), 
+                               np.max(transformed_corners[:,:,0]), np.max(transformed_corners[:,:,1])]
 
-        # Now, iterate through all candidate tiles in image B to find the best one
         for tile_b in tiles_B:
-            # Calculate the intersection area between the projected box and the candidate tile
             area = _calculate_intersection_area(projected_bbox_in_B, tile_b["bounds_in_parent"])
-
-            # If this tile is a better match, update our records
             if area > max_area:
                 max_area = area
                 best_match_tile_b = tile_b
         
-        # After checking all tiles in B, if we found a valid match for tile_a, add it to our list.
-        # We use a small threshold to ensure there's a meaningful overlap.
         if best_match_tile_b is not None and max_area > 1:
-            overlapping_pairs.append((tile_a, best_match_tile_b))
-                
-    return overlapping_pairs
+            # Store the candidate and its overlap area for the next pass
+            candidate_pairs.append({'a': tile_a, 'b': best_match_tile_b, 'area': max_area})
+
+    # --- Pass 2: De-conflict claims. Enforce that each B tile is claimed only once. ---
+    claimed_b_tiles = defaultdict(list)
+    for pair in candidate_pairs:
+        # Group all claims by the ID of the B tile
+        claimed_b_tiles[pair['b']['tile_id']].append(pair)
+
+    final_pairs = []
+    for b_tile_id, claims in claimed_b_tiles.items():
+        if len(claims) == 1:
+            # If there's only one claim, it's a valid match.
+            final_pairs.append((claims[0]['a'], claims[0]['b']))
+        else:
+            # If multiple A tiles claim this B tile, find the one with the best overlap area.
+            winner = max(claims, key=lambda x: x['area'])
+            final_pairs.append((winner['a'], winner['b']))
+            
+    return final_pairs

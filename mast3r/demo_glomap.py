@@ -21,7 +21,7 @@ import torch
 from kapture.converter.colmap.database_extra import kapture_to_colmap, get_colmap_image_ids_from_db
 from kapture.converter.colmap.database import COLMAPDatabase
 
-from mast3r.colmap.mapping import kapture_import_image_folder_or_list, run_mast3r_matching, glomap_run_mapper
+from mast3r.colmap.mapping import kapture_import_image_folder_or_list, run_mast3r_matching, glomap_run_mapper, colmap_run_incremental_mapper
 from mast3r.demo import set_scenegraph_options
 from mast3r.retrieval.processor import Retriever
 from mast3r.image_pairs import make_pairs
@@ -216,7 +216,6 @@ def determine_overlapping_tile_pairs(tiles_A, tiles_B, transform_A_to_B):
                 overlapping_pairs.append((tile_a, tile_b))
                 
     return overlapping_pairs
-
 
 def run_chunked_pipeline(image_pairs_to_match, model, device, precomputed_transforms, tile_size=(1024, 1024), overlap_px=256):
     """
@@ -579,38 +578,60 @@ def get_reconstructed_scene_J(glomap_bin, outdir, gradio_delete_cache, model, re
         shutil.rmtree(reconstruction_path)
     os.makedirs(reconstruction_path, exist_ok=True)
     
-    #
-    # --- START: NEW GLOMAP CONFIGURATION AND CALL ---
+    # #
+    # # --- START: OLD GLOMAP CONFIGURATION AND CALL ---
+    # #
+    
+    # # Define the custom options we need to pass to GLOMAP.
+    # # This is the core of the fix.
+    # glomap_options = {
+    #     # This allows tracks of length 2, which we already have.
+    #     "--TrackEstablishment.min_num_view_per_track": "2",
+        
+    #     # This makes geometric verification more tolerant for high-res images.
+    #     "--RelPoseEstimation.max_epipolar_error": "8",
+
+    #     #
+    #     # --- THIS IS THE NEW, CRITICAL FIX ---
+    #     #
+    #     # Lower the minimum required triangulation angle from the default of 1.0
+    #     # to a much smaller value suitable for aerial imagery with low parallax.
+    #     # A value of 0.1 is a good starting point.
+    #     "--Triangulation.min_angle": "0.0001"
+    # }
+
+    # # Call the modified function with the new options.
+    # glomap_run_mapper(
+    #     glomap_bin=glomap_bin,
+    #     colmap_db_path=colmap_db_path,
+    #     recon_path=reconstruction_path,
+    #     image_root_path=root_path,
+    #     options=glomap_options
+    # )
+
+    # # --- END: NEW GLOMAP CONFIGURATION AND CALL ---
+    # #
+    
+        #
+    # --- START: REPLACEMENT of Glomap with COLMAP Incremental Mapper ---
     #
     
-    # Define the custom options we need to pass to GLOMAP.
-    # This is the core of the fix.
-    glomap_options = {
-        # This allows tracks of length 2, which we already have.
-        "--TrackEstablishment.min_num_view_per_track": "2",
-        
-        # This makes geometric verification more tolerant for high-res images.
-        "--RelPoseEstimation.max_epipolar_error": "8",
+    # Remove the GLOMAP options and the call to glomap_run_mapper.
+    # Instead, call our new function.
+    
+    try:
+        # The incremental mapper directly returns the reconstruction object.
+        output_recon = colmap_run_incremental_mapper(
+            database_path=colmap_db_path,
+            image_path=root_path,
+            output_path=reconstruction_path
+        )
+    except Exception as e:
+        print(f"An error occurred during COLMAP incremental mapping: {e}")
+        # Handle the error appropriately, maybe return None or an empty state.
+        return None, None # Or some other failure indicator
 
-        #
-        # --- THIS IS THE NEW, CRITICAL FIX ---
-        #
-        # Lower the minimum required triangulation angle from the default of 1.0
-        # to a much smaller value suitable for aerial imagery with low parallax.
-        # A value of 0.1 is a good starting point.
-        "--Triangulation.min_angle": "0.0001"
-    }
-
-    # Call the modified function with the new options.
-    glomap_run_mapper(
-        glomap_bin=glomap_bin,
-        colmap_db_path=colmap_db_path,
-        recon_path=reconstruction_path,
-        image_root_path=root_path,
-        options=glomap_options
-    )
-
-    # --- END: NEW GLOMAP CONFIGURATION AND CALL ---
+    # --- END: REPLACEMENT ---
     #
     
     if current_scene_state is not None and \
@@ -620,22 +641,30 @@ def get_reconstructed_scene_J(glomap_bin, outdir, gradio_delete_cache, model, re
     else:
         outfile_name = tempfile.mktemp(suffix='_scene.glb', dir=outdir)
 
-    ouput_recon = pycolmap.Reconstruction(os.path.join(reconstruction_path, '0'))
-    print(ouput_recon.summary())
+    # output_recon = pycolmap.Reconstruction(os.path.join(reconstruction_path, '0'))
+    # print(output_recon.summary())
+    print("Reconstruction Summary:")
+    print(output_recon.summary())
+    
+    # Check if the reconstruction was successful before proceeding.
+    if output_recon.num_points3D() == 0:
+        print("Warning: Reconstruction was created but contains 0 3D points.")
+        # Handle this case, perhaps by returning gracefully.
+        return None, None
 
     colmap_world_to_cam = {}
     colmap_intrinsics = {}
     colmap_image_id_to_name = {}
     images = {}
-    num_reg_images = ouput_recon.num_reg_images()
-    for idx, (colmap_imgid, colmap_image) in enumerate(ouput_recon.images.items()):
+    num_reg_images = output_recon.num_reg_images()
+    for idx, (colmap_imgid, colmap_image) in enumerate(output_recon.images.items()):
         colmap_image_id_to_name[colmap_imgid] = colmap_image.name
         if callable(colmap_image.cam_from_world):
             colmap_world_to_cam[colmap_imgid] = colmap_image.cam_from_world().matrix(
             )
         else:
             colmap_world_to_cam[colmap_imgid] = colmap_image.cam_from_world.matrix
-        camera = ouput_recon.cameras[colmap_image.camera_id]
+        camera = output_recon.cameras[colmap_image.camera_id]
         K = np.eye(3)
         K[0, 0] = camera.focal_length_x
         K[1, 1] = camera.focal_length_y
@@ -649,8 +678,8 @@ def get_reconstructed_scene_J(glomap_bin, outdir, gradio_delete_cache, model, re
         if idx + 1 == num_reg_images:
             break  # bug with the iterable ?
     points3D = []
-    num_points3D = ouput_recon.num_points3D()
-    for idx, (pt3d_id, pts3d) in enumerate(ouput_recon.points3D.items()):
+    num_points3D = output_recon.num_points3D()
+    for idx, (pt3d_id, pts3d) in enumerate(output_recon.points3D.items()):
         points3D.append((pts3d.xyz, pts3d.color))
         if idx + 1 == num_points3D:
             break  # bug with the iterable ?

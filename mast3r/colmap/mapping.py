@@ -215,6 +215,81 @@ def glomap_run_mapper(glomap_bin, colmap_db_path, recon_path, image_root_path, o
         )
 
 
+def colmap_run_incremental_mapper(
+    database_path: str,
+    image_path: str,
+    output_path: str,
+    custom_options: dict = None # Allows for advanced user overrides
+):
+    """
+    CORRECTED and FINAL VERSION using the precise pycolmap API.
+    Runs the COLMAP incremental mapper with a configuration highly optimized
+    for challenging, low-parallax aerial datasets.
+
+    Args:
+        database_path (str): Path to the COLMAP database file.
+        image_path (str): Path to the root directory containing the images.
+        output_path (str): Path to the directory where the reconstruction will be saved.
+        custom_options (dict, optional): Dictionary to override any specific option.
+    """
+    print("Running COLMAP's incremental mapper with optimized aerial settings...")
+    
+    # --- Step 1: Instantiate the top-level options class ---
+    # This is the main configuration object for the entire pipeline.
+    options = pycolmap.IncrementalPipelineOptions()
+
+    # --- Step 2: Set the nested Triangulation options ---
+    # These options control how 3D points are created from 2D matches.
+    
+    # CRITICAL FIX 1: Allow two-view tracks.
+    # The default (`True`) ignores all matches from a 2-view scene. We must set it to `False`.
+    options.triangulation.ignore_two_view_tracks = False
+    
+    # CRITICAL FIX 2: Lower the minimum triangulation angle.
+    # The default (1.5 degrees) is too strict for low-parallax aerial data.
+    options.triangulation.min_angle = 0.005
+
+    # --- Step 3: Set the nested Mapper options ---
+    # These options control the main SfM process: initialization, filtering, etc.
+    
+    # Also lower the post-bundle-adjustment filter to be consistent with the triangulation setting.
+    options.mapper.filter_min_tri_angle = 0.005
+
+    # Increase the initial error tolerance to help find a good starting pair with our high-res images.
+    options.mapper.init_max_error = 12.0
+
+    # Increase the final reprojection error filter to avoid discarding good points.
+    options.mapper.filter_max_reproj_error = 12.0
+
+    # --- Step 4: Handle custom user overrides (for advanced use) ---
+    if custom_options:
+        options.mergedict(custom_options)
+
+    # --- Step 5: Print a summary and run the mapper ---
+    print("Using the following optimized pipeline options:")
+    # The .summary() method provides a clean, readable output of all settings.
+    print(options.summary())
+
+    # The pycolmap documentation uses `incremental_mapping`. Let's use that.
+    # This function takes the paths and the fully configured options object.
+    reconstructions = pycolmap.incremental_mapping(
+        database_path=database_path,
+        image_path=image_path,
+        output_path=output_path,
+        options=options
+    )
+    
+    if not reconstructions:
+        raise RuntimeError("Incremental mapping failed to produce a reconstruction.")
+    
+    print(f"Successfully created {len(reconstructions)} reconstruction(s).")
+    
+    # Find and return the largest reconstruction (most images registered).
+    largest_recon_id = max(reconstructions, key=lambda rid: reconstructions[rid].num_reg_images())
+    
+    return reconstructions[largest_recon_id]
+
+
 def kapture_import_image_folder_or_list(images_path: Union[str, Tuple[str, List[str]]], use_single_camera=False) -> kapture.Kapture:
     images = kapture.RecordsCamera()
 
