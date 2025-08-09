@@ -10,6 +10,7 @@ import cv2
 from torchvision import transforms
 from collections import defaultdict
 from itertools import combinations # We need this for creating pairs
+from multiprocessing import Pool
 
 # You will need these helper functions from the original mast3r repository's utils.
 # Make sure they are available in your Python path.
@@ -32,50 +33,42 @@ except ImportError:
     ])
 
 class DisjointSet:
-    """
-    A simple Disjoint Set Union (DSU) or Union-Find data structure.
-    Used to efficiently track and merge sets of connected components,
-    which in our case are the feature tracks.
-    """
     def __init__(self):
         self.parent = {}
         self.rank = {}
+        self.image_sets = {}  # Track images per set
 
     def find(self, i):
-        """Finds the root representative of the set containing element i."""
         if self.parent.get(i) is None:
-            # This element is new; it becomes its own parent.
             self.parent[i] = i
             self.rank[i] = 0
-        
-        # Path compression for efficiency
+            self.image_sets[i] = {i[0]}  # Initialize with image path
         if self.parent[i] != i:
             self.parent[i] = self.find(self.parent[i])
         return self.parent[i]
 
     def union(self, i, j):
-        """Merges the sets containing elements i and j."""
         root_i = self.find(i)
         root_j = self.find(j)
-
         if root_i != root_j:
-            # Union by rank for a more balanced tree
             if self.rank[root_i] > self.rank[root_j]:
                 self.parent[root_j] = root_i
+                self.image_sets[root_i].update(self.image_sets[root_j])
+                del self.image_sets[root_j]
             else:
                 self.parent[root_i] = root_j
+                self.image_sets[root_j].update(self.image_sets[root_i])
+                del self.image_sets[root_i]
                 if self.rank[root_i] == self.rank[root_j]:
                     self.rank[root_j] += 1
 
     def get_all_subsets(self):
-        """Returns all the disjoint sets as a list of lists."""
         subsets = defaultdict(list)
         for item in self.parent:
             root = self.find(item)
             subsets[root].append(item)
         return list(subsets.values())
-
-
+    
 def _cluster_keypoints(aggregated_matches):
     """
     Step 1: Takes raw matches and clusters keypoints within each image to find
@@ -87,15 +80,15 @@ def _cluster_keypoints(aggregated_matches):
     all_kpts_per_image = defaultdict(list)
     
     # Iterate through the matches and append keypoints to the correct image path list
-    for (path_A, path_B), match_data in aggregated_matches.items():
+    for (path_A, path_B), match_data in tqdm(aggregated_matches.items(), total=len(aggregated_matches), desc="Clustering Keypoints", leave=False):
         all_kpts_per_image[path_A].append(match_data["kpts0"])
         all_kpts_per_image[path_B].append(match_data["kpts1"])
 
     unique_kpts_per_image = {}
-    for path, kpt_list in all_kpts_per_image.items():
+    for path, kpt_list in tqdm(all_kpts_per_image.items(), total=len(all_kpts_per_image), desc="Deduplicating Keypoints", leave=False):
         if not kpt_list: continue
         all_kpts = np.concatenate(kpt_list, axis=0)
-        _, unique_indices = np.unique(np.round(all_kpts), axis=0, return_index=True)
+        _, unique_indices = np.unique(all_kpts, axis=0, return_index=True)
         unique_kpts_per_image[path] = all_kpts[unique_indices]
         
     return unique_kpts_per_image
@@ -103,29 +96,48 @@ def _cluster_keypoints(aggregated_matches):
 def _build_and_merge_tracks(aggregated_matches, unique_kpts_per_image, distance_threshold):
     """
     Step 2: Builds tracks from pairwise matches and merges them using a DisjointSet.
+    Optimized to deduplicate keypoints within each image before union operations
+    and ensures each track has at most one keypoint per image.
     """
-    print("Step 2: Building and merging tracks...")
+    print("Step 2: Building and merging tracks with early deduplication...")
     dsu = DisjointSet()
     
     # Pre-build k-d trees for fast lookups
     trees = {path: cKDTree(kpts) for path, kpts in unique_kpts_per_image.items()}
 
     for (path_A, path_B), match_data in aggregated_matches.items():
-        if path_A not in trees or path_B not in trees: continue
+        if path_A not in trees or path_B not in trees:
+            continue
             
         # Find the unique index for each raw keypoint in the match
         _, indices_A = trees[path_A].query(match_data["kpts0"], distance_upper_bound=distance_threshold)
         _, indices_B = trees[path_B].query(match_data["kpts1"], distance_upper_bound=distance_threshold)
 
-        # For each valid match, union the corresponding unique keypoints into a track
+        # Group matches by unique keypoint indices to deduplicate within each image pair
+        matches_by_index = {}
         for i in range(len(indices_A)):
             idx_A, idx_B = indices_A[i], indices_B[i]
             
             # Check if both points were found in the tree
             if idx_A < len(unique_kpts_per_image[path_A]) and idx_B < len(unique_kpts_per_image[path_B]):
-                # A "point" is uniquely identified by its image path and its index within that image
-                point_A = (path_A, idx_A)
-                point_B = (path_B, idx_B)
+                # Use the pair of indices as a key to represent the track connection
+                match_key = (idx_A, idx_B)
+                if match_key not in matches_by_index:
+                    # Store the first valid match for this (idx_A, idx_B) pair
+                    matches_by_index[match_key] = ((path_A, idx_A), (path_B, idx_B))
+        
+        # Perform union operations with image-based deduplication
+        for (idx_A, idx_B), (point_A, point_B) in matches_by_index.items():
+            # Check the current representatives in the DSU
+            root_A = dsu.find(point_A)
+            root_B = dsu.find(point_B)
+            
+            # Get the images in each set
+            set_A_images = dsu.image_sets.get(root_A, {point_A[0]})
+            set_B_images = dsu.image_sets.get(root_B, {point_B[0]})            
+            
+            # Only perform union if it doesn't add multiple keypoints from the same image
+            if path_A not in set_B_images and path_B not in set_A_images:
                 dsu.union(point_A, point_B)
                 
     return dsu.get_all_subsets()
@@ -154,7 +166,7 @@ def _filter_and_finalize(all_tracks, unique_kpts_per_image, min_len_track):
     point_to_new_idx = {}
     
     # --- The Single, Efficient Pass Over All Tracks ---
-    for track in tqdm(all_tracks, desc="Processing Tracks", total=len(all_tracks), unit="tracks"):
+    for track in tqdm(all_tracks, desc="Processing Tracks", total=len(all_tracks), unit="tracks", leave=False):
         #
         # --- Stage 1: Filter Tracks and Find Unique Representatives ---
         #
@@ -392,7 +404,7 @@ def run_chunked_mast3r_matching(
         if not overlapping_tile_pairs: continue
 
         # Process all tile pairs for this image pair in batches
-        for i in tqdm(range(0, len(overlapping_tile_pairs), batch_size), desc="Matching Tile Pairs", total=len(overlapping_tile_pairs), leave=False):
+        for i in tqdm(range(0, len(overlapping_tile_pairs), batch_size), desc="Matching Tile Pairs", total=(len(overlapping_tile_pairs) // batch_size), leave=False):
             batch_of_pairs = overlapping_tile_pairs[i:i + batch_size]
             
             # Create a LIST of TUPLES in the exact format `inference` expects.
