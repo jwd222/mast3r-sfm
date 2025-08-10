@@ -548,7 +548,8 @@ def get_reconstructed_scene_J(glomap_bin, outdir, gradio_delete_cache, model, re
             root_path=root_path,
             colmap_db=colmap_db,
             precomputed_transforms=precomputed_transforms,
-            conf_thr=3.0 # Or pass from UI
+            conf_thr=3.0,
+            dedup_distance=2.0,
         )
         colmap_db.close()
     except Exception as e:

@@ -11,6 +11,9 @@ from torchvision import transforms
 from collections import defaultdict
 from itertools import combinations # We need this for creating pairs
 from multiprocessing import Pool
+import time
+# import cupy as cp
+# import cupyx.scipy.spatial  # CuPy's scipy-compatible KD-Tree
 
 # You will need these helper functions from the original mast3r repository's utils.
 # Make sure they are available in your Python path.
@@ -32,36 +35,65 @@ except ImportError:
         transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
     ])
 
+
 class DisjointSet:
+    """
+    An enhanced Disjoint Set Union (DSU) data structure.
+    It tracks not only the sets of points but also the set of unique image paths
+    within each track, preventing invalid merges.
+    """
     def __init__(self):
         self.parent = {}
         self.rank = {}
-        self.image_sets = {}  # Track images per set
+        # This new dictionary is the key: maps a track's root to the set of image paths it contains.
+        self.image_sets = {}
 
     def find(self, i):
-        if self.parent.get(i) is None:
+        """Finds the root representative of the set containing element i."""
+        if i not in self.parent:
+            # Initialize a new element. It is its own parent.
             self.parent[i] = i
             self.rank[i] = 0
-            self.image_sets[i] = {i[0]}  # Initialize with image path
+            # A new track initially contains only the image of its first point.
+            # i[0] is the path from the tuple (path, index).
+            self.image_sets[i] = {i[0]}
+        
+        # Path compression for efficiency
         if self.parent[i] != i:
             self.parent[i] = self.find(self.parent[i])
         return self.parent[i]
 
     def union(self, i, j):
+        """
+        Merges the sets containing i and j, ONLY IF the merge is valid
+        (i.e., they do not share any common image paths).
+        """
         root_i = self.find(i)
         root_j = self.find(j)
-        if root_i != root_j:
-            if self.rank[root_i] > self.rank[root_j]:
-                self.parent[root_j] = root_i
-                self.image_sets[root_i].update(self.image_sets[root_j])
-                del self.image_sets[root_j]
-            else:
-                self.parent[root_i] = root_j
-                self.image_sets[root_j].update(self.image_sets[root_i])
-                del self.image_sets[root_i]
-                if self.rank[root_i] == self.rank[root_j]:
-                    self.rank[root_j] += 1
 
+        if root_i != root_j:
+            # --- This is the GUARD CONDITION ---
+            # Check if the sets of images are disjoint before merging.
+            if self.image_sets[root_i].isdisjoint(self.image_sets[root_j]):
+                # The merge is valid. Proceed with standard union by rank.
+                if self.rank[root_i] > self.rank[root_j]:
+                    self.parent[root_j] = root_i
+                    # Merge image sets
+                    self.image_sets[root_i].update(self.image_sets[root_j])
+                else:
+                    self.parent[root_i] = root_j
+                    # Merge image sets
+                    self.image_sets[root_j].update(self.image_sets[root_i])
+                    if self.rank[root_i] == self.rank[root_j]:
+                        self.rank[root_j] += 1
+    
+    def get_all_subsets(self):
+        """Returns all the disjoint sets as a list of lists."""
+        subsets = defaultdict(list)
+        for item in self.parent:
+            root = self.find(item)
+            subsets[root].append(item)
+        return list(subsets.values())
     def get_all_subsets(self):
         subsets = defaultdict(list)
         for item in self.parent:
@@ -80,12 +112,12 @@ def _cluster_keypoints(aggregated_matches):
     all_kpts_per_image = defaultdict(list)
     
     # Iterate through the matches and append keypoints to the correct image path list
-    for (path_A, path_B), match_data in tqdm(aggregated_matches.items(), total=len(aggregated_matches), desc="Clustering Keypoints", leave=False):
+    for (path_A, path_B), match_data in aggregated_matches.items():
         all_kpts_per_image[path_A].append(match_data["kpts0"])
         all_kpts_per_image[path_B].append(match_data["kpts1"])
 
     unique_kpts_per_image = {}
-    for path, kpt_list in tqdm(all_kpts_per_image.items(), total=len(all_kpts_per_image), desc="Deduplicating Keypoints", leave=False):
+    for path, kpt_list in tqdm(all_kpts_per_image.items(), total=len(all_kpts_per_image), desc="Generating unique keypoints", leave=False):
         if not kpt_list: continue
         all_kpts = np.concatenate(kpt_list, axis=0)
         _, unique_indices = np.unique(all_kpts, axis=0, return_index=True)
@@ -93,57 +125,148 @@ def _cluster_keypoints(aggregated_matches):
         
     return unique_kpts_per_image
 
+
+def __cluster_keypoints(aggregated_matches, cluster_distance=2.0):
+    print("Step 1: Clustering keypoints with GPU...")
+    all_kpts_per_image = defaultdict(list)
+    
+    for (path_A, path_B), match_data in aggregated_matches.items():
+        all_kpts_per_image[path_A].append(match_data["kpts0"])
+        all_kpts_per_image[path_B].append(match_data["kpts1"])
+
+    unique_kpts_per_image = {}
+    for path, kpt_list in all_kpts_per_image.items():
+        if not kpt_list: continue
+        all_kpts = np.concatenate(kpt_list, axis=0)
+        all_kpts_gpu = cp.asarray(all_kpts)
+        
+        tree = cupyx.scipy.spatial.KDTree(all_kpts_gpu)
+        pairs = tree.query_pairs(r=cluster_distance, output_type='ndarray')
+        if len(pairs) > 0:
+            keep_indices = cp.setdiff1d(cp.arange(len(all_kpts_gpu)), pairs[:, 1])
+            unique_kpts = cp.asnumpy(all_kpts_gpu[keep_indices])
+        else:
+            unique_kpts = cp.asnumpy(all_kpts_gpu)
+        
+        unique_kpts_per_image[path] = unique_kpts
+    
+    return unique_kpts_per_image
+
+
 def _build_and_merge_tracks(aggregated_matches, unique_kpts_per_image, distance_threshold):
     """
-    Step 2: Builds tracks from pairwise matches and merges them using a DisjointSet.
-    Optimized to deduplicate keypoints within each image before union operations
-    and ensures each track has at most one keypoint per image.
+    Step 2: Builds tracks from pairwise matches.
+    This version uses the enhanced DisjointSet to intelligently and correctly
+    merge tracks, preventing tracks from containing multiple points from the same image.
     """
-    print("Step 2: Building and merging tracks with early deduplication...")
+    print("Step 2: Building and merging tracks with invariant enforcement...")
+    dsu = DisjointSet()
+    trees = {path: cKDTree(kpts) for path, kpts in unique_kpts_per_image.items()}
+
+    # --- Pass 1: Collect all valid connections (same as before) ---
+    all_connections = set()
+    print("  - Pass 1/2: Collecting all pairwise connections...")
+    for (path_A, path_B), match_data in tqdm(aggregated_matches.items(), desc="Collecting Edges", leave=False):
+        if path_A not in trees or path_B not in trees: continue
+        _, indices_A = trees[path_A].query(match_data["kpts0"], distance_upper_bound=distance_threshold)
+        _, indices_B = trees[path_B].query(match_data["kpts1"], distance_upper_bound=distance_threshold)
+
+        for i in range(len(indices_A)):
+            idx_A, idx_B = indices_A[i], indices_B[i]
+            if idx_A < len(unique_kpts_per_image[path_A]) and idx_B < len(unique_kpts_per_image[path_B]):
+                point_A = (path_A, idx_A)
+                point_B = (path_B, idx_B)
+                connection = tuple(sorted((point_A, point_B)))
+                all_connections.add(connection)
+
+    # --- Pass 2: Build tracks using the smarter DSU ---
+    print(f"  - Pass 2/2: Merging {len(all_connections)} connections into tracks...")
+    for point_A, point_B in tqdm(all_connections, desc="Building Tracks", leave=False):
+        # The new `union` method now contains the critical safety check.
+        dsu.union(point_A, point_B)
+
+    return dsu.get_all_subsets()
+
+
+def _build_and_merge_tracks_tmp(aggregated_matches, unique_kpts_per_image, distance_threshold=3):
+    """
+    Step 2: Builds tracks from pairwise matches and merges them using a DisjointSet.
+    """
+    print("Step 2: Building and merging tracks...")
     dsu = DisjointSet()
     
     # Pre-build k-d trees for fast lookups
     trees = {path: cKDTree(kpts) for path, kpts in unique_kpts_per_image.items()}
 
-    for (path_A, path_B), match_data in aggregated_matches.items():
-        if path_A not in trees or path_B not in trees:
-            continue
+    for (path_A, path_B), match_data in tqdm(aggregated_matches.items(), total=len(aggregated_matches), desc="Building and merging tracks", leave=False):
+        if path_A not in trees or path_B not in trees: continue
             
         # Find the unique index for each raw keypoint in the match
         _, indices_A = trees[path_A].query(match_data["kpts0"], distance_upper_bound=distance_threshold)
         _, indices_B = trees[path_B].query(match_data["kpts1"], distance_upper_bound=distance_threshold)
 
-        # Group matches by unique keypoint indices to deduplicate within each image pair
-        matches_by_index = {}
-        for i in range(len(indices_A)):
+        # For each valid match, union the corresponding unique keypoints into a track
+        for i in tqdm(range(len(indices_A)), desc="Unioning tracks", leave=False):
             idx_A, idx_B = indices_A[i], indices_B[i]
             
             # Check if both points were found in the tree
             if idx_A < len(unique_kpts_per_image[path_A]) and idx_B < len(unique_kpts_per_image[path_B]):
-                # Use the pair of indices as a key to represent the track connection
+                # A "point" is uniquely identified by its image path and its index within that image
+                point_A = (path_A, idx_A)
+                point_B = (path_B, idx_B)
+                dsu.union(point_A, point_B)
+                
+    return dsu.get_all_subsets()
+
+def __build_and_merge_tracks(aggregated_matches, unique_kpts_per_image, distance_threshold):
+    """
+    Step 2: Builds tracks from pairwise matches and merges them using a DisjointSet.
+    Optimized with GPU-accelerated KD-Tree queries and early deduplication.
+    """
+    print("Step 2: Building and merging tracks with GPU KD-Tree...")
+    dsu = DisjointSet()
+    
+    # Pre-build k-d trees on GPU
+    trees = {path: cupyx.scipy.spatial.KDTree(cp.asarray(kpts)) for path, kpts in unique_kpts_per_image.items()}
+
+    for (path_A, path_B), match_data in aggregated_matches.items():
+        if path_A not in trees or path_B not in trees:
+            continue
+            
+        # Move keypoints to GPU
+        kpts0_gpu = cp.asarray(match_data["kpts0"])
+        kpts1_gpu = cp.asarray(match_data["kpts1"])
+        
+        # Find the unique index for each raw keypoint in the match
+        _, indices_A = trees[path_A].query(kpts0_gpu, distance_upper_bound=distance_threshold)
+        _, indices_B = trees[path_B].query(kpts1_gpu, distance_upper_bound=distance_threshold)
+        
+        # Move indices back to CPU for DSU processing
+        indices_A = cp.asnumpy(indices_A)
+        indices_B = cp.asnumpy(indices_B)
+        
+        # Group matches by unique keypoint indices to deduplicate within each image pair
+        matches_by_index = {}
+        for i in range(len(indices_A)):
+            idx_A, idx_B = indices_A[i], indices_B[i]
+            if idx_A < len(unique_kpts_per_image[path_A]) and idx_B < len(unique_kpts_per_image[path_B]):
                 match_key = (idx_A, idx_B)
                 if match_key not in matches_by_index:
-                    # Store the first valid match for this (idx_A, idx_B) pair
                     matches_by_index[match_key] = ((path_A, idx_A), (path_B, idx_B))
         
         # Perform union operations with image-based deduplication
         for (idx_A, idx_B), (point_A, point_B) in matches_by_index.items():
-            # Check the current representatives in the DSU
             root_A = dsu.find(point_A)
             root_B = dsu.find(point_B)
-            
-            # Get the images in each set
             set_A_images = dsu.image_sets.get(root_A, {point_A[0]})
-            set_B_images = dsu.image_sets.get(root_B, {point_B[0]})            
-            
-            # Only perform union if it doesn't add multiple keypoints from the same image
-            if path_A not in set_B_images and path_B not in set_A_images:
+            set_B_images = dsu.image_sets.get(root_B, {point_B[0]})
+            if point_A[0] not in set_B_images and point_B[0] not in set_A_images:
                 dsu.union(point_A, point_B)
                 
     return dsu.get_all_subsets()
 
 
-def _filter_and_finalize(all_tracks, unique_kpts_per_image, min_len_track):
+def _filter_and_finalize_tmp(all_tracks, unique_kpts_per_image, min_len_track):
     """
     FINAL, ROBUST, AND EFFICIENT VERSION.
 
@@ -166,7 +289,7 @@ def _filter_and_finalize(all_tracks, unique_kpts_per_image, min_len_track):
     point_to_new_idx = {}
     
     # --- The Single, Efficient Pass Over All Tracks ---
-    for track in tqdm(all_tracks, desc="Processing Tracks", total=len(all_tracks), unit="tracks", leave=False):
+    for track in tqdm(all_tracks, desc="Finalizing Tracks", total=len(all_tracks), unit="tracks", leave=False):
         #
         # --- Stage 1: Filter Tracks and Find Unique Representatives ---
         #
@@ -235,7 +358,112 @@ def _filter_and_finalize(all_tracks, unique_kpts_per_image, min_len_track):
 
     return final_keypoints_np, final_matches_indexed_np
 
-  
+
+def _filter_and_finalize(all_tracks, unique_kpts_per_image, min_len_track):
+    """
+    SIMPLIFIED AND FASTER VERSION.
+    Since tracks from the new builder are guaranteed to be clean (one point per image),
+    this function just needs to filter by length and format the output.
+    """
+    print("Step 3: Filtering clean tracks and finalizing...")
+    
+    final_keypoints = defaultdict(list)
+    final_matches_indexed = defaultdict(list)
+    point_to_new_idx = {}
+    
+    for track in tqdm(all_tracks, desc="Finalizing Tracks", leave=False):
+        # The track length is now simply the number of points in the list.
+        if len(track) < min_len_track:
+            continue
+            
+        # Since the track is clean, every point in it is valid and needs a new index.
+        for path, old_idx in track:
+            point_id = (path, old_idx)
+            if point_id not in point_to_new_idx:
+                new_idx = len(final_keypoints[path])
+                point_to_new_idx[point_id] = new_idx
+                kpt_coords = unique_kpts_per_image[path][old_idx]
+                final_keypoints[path].append(kpt_coords)
+
+        # The combinations call is now guaranteed to be cheap and correct.
+        for point1, point2 in combinations(track, 2):
+            path1, _ = point1
+            path2, _ = point2
+            new_idx1 = point_to_new_idx[point1]
+            new_idx2 = point_to_new_idx[point2]
+            
+            if path1 > path2:
+                path1, path2 = path2, path1
+                new_idx1, new_idx2 = new_idx2, new_idx1
+            
+            final_matches_indexed[(path1, path2)].append([new_idx1, new_idx2])
+    
+    final_keypoints_np = {path: np.array(kpts) for path, kpts in final_keypoints.items()}
+    final_matches_indexed_np = {pair: np.array(matches) for pair, matches in final_matches_indexed.items()}
+
+    return final_keypoints_np, final_matches_indexed_np
+
+
+def __filter_and_finalize(all_tracks, unique_kpts_per_image, min_len_track):
+    print("Step 3: Filtering tracks and finalizing with GPU pair generation...")
+    final_keypoints = defaultdict(list)
+    final_matches_indexed = defaultdict(list)
+    point_to_new_idx = {}
+    
+    # Convert tracks to GPU for pair generation
+    def generate_pairs_gpu(track):
+        track_images = {path for path, idx in track}
+        if len(track_images) < min_len_track:
+            return None, None
+        
+        representative_points = {}
+        for path, old_idx in track:
+            if path not in representative_points:
+                representative_points[path] = (path, old_idx)
+        clean_track = list(representative_points.values())
+        
+        # Generate pairs on GPU
+        track_array = cp.array([(path, idx) for path, idx in clean_track], dtype=object)
+        pairs = []
+        for i in range(len(track_array)):
+            for j in range(i + 1, len(track_array)):
+                pairs.append((track_array[i], track_array[j]))
+        return clean_track, cp.array(pairs, dtype=object)
+    
+    # Process tracks on GPU
+    all_clean_tracks = []
+    all_pairs = []
+    for track in tqdm(all_tracks, desc="Processing Tracks", total=len(all_tracks)):
+        clean_track, pairs = generate_pairs_gpu(track)
+        if clean_track:
+            all_clean_tracks.append(clean_track)
+            all_pairs.append(cp.asnumpy(pairs))
+    
+    # CPU processing for index assignment and match finalization
+    for clean_track, pairs in zip(all_clean_tracks, all_pairs):
+        for path, old_idx in clean_track:
+            point_id = (path, old_idx)
+            if point_id not in point_to_new_idx:
+                new_idx = len(final_keypoints[path])
+                point_to_new_idx[point_id] = new_idx
+                kpt_coords = unique_kpts_per_image[path][old_idx]
+                final_keypoints[path].append(kpt_coords)
+        
+        for point1, point2 in pairs:
+            path1, _ = point1
+            path2, _ = point2
+            new_idx1 = point_to_new_idx[tuple(point1)]
+            new_idx2 = point_to_new_idx[tuple(point2)]
+            if path1 > path2:
+                path1, path2 = path2, path1
+                new_idx1, new_idx2 = new_idx2, new_idx1
+            final_matches_indexed[(path1, path2)].append([new_idx1, new_idx2])
+    
+    final_keypoints_np = {path: np.array(kpts) for path, kpts in final_keypoints.items()}
+    final_matches_indexed_np = {pair: np.array(matches) for pair, matches in final_matches_indexed.items()}
+    
+    return final_keypoints_np, final_matches_indexed_np
+
 def extract_matches_from_tile_prediction(pred1, pred2, shape1, shape2, conf_thr=3.0, device='cuda'):
     """
     CORRECTED VERSION.
@@ -316,7 +544,16 @@ def deduplicate_and_format_for_colmap(
     unique_kpts_per_image = _cluster_keypoints(aggregated_matches)
 
     # Step 2: Build pairwise connections and merge them into complete tracks.
-    all_tracks = _build_and_merge_tracks(aggregated_matches, unique_kpts_per_image, distance_threshold)
+    # start_time = time.time()
+    all_tracks = _build_and_merge_tracks(aggregated_matches, unique_kpts_per_image, distance_threshold=distance_threshold)
+    # print(f"Time for distance of 3: {time.time() - start_time} seconds")
+    # start_time = time.time()
+    # all_tracks_2 = _build_and_merge_tracks(aggregated_matches, unique_kpts_per_image, distance_threshold=4)
+    # print(f"Time for distance of 4: {time.time() - start_time} seconds")
+    # start_time = time.time()
+    # all_tracks_3 = _build_and_merge_tracks(aggregated_matches, unique_kpts_per_image, distance_threshold=2)
+    # print(f"Time for distance of 2.0: {time.time() - start_time} seconds")
+    
 
     # Step 3: Filter out short tracks and re-index the surviving keypoints and matches.
     final_keypoints, final_matches = _filter_and_finalize(
@@ -330,7 +567,7 @@ def deduplicate_and_format_for_colmap(
 def run_chunked_mast3r_matching(
     model, device, image_pairs_to_match, root_path, colmap_db,
     precomputed_transforms,
-    tile_size=(512, 512), overlap_px=128, conf_thr=3.0):
+    tile_size=(512, 512), overlap_px=128, batch_size=4, conf_thr=3.0, dedup_distance=2.0):
     """
     The COMPLETE REPLACEMENT for the original `run_mast3r_matching` function.
     It orchestrates the tiling, matching, aggregation, and database export.
@@ -346,7 +583,7 @@ def run_chunked_mast3r_matching(
 
     # --- Part B: Inference on Tile Pairs and Match Aggregation ---
     aggregated_matches_temp = {} # Use a temporary dictionary
-    batch_size = 2 # Adjust based on GPU memory
+    # batch_size = 4 # Adjust based on GPU memory
     
     # --- START: NEW CACHING LOGIC ---
     # This cache will store the computed tile pairs to avoid redundant work.
@@ -359,6 +596,9 @@ def run_chunked_mast3r_matching(
         
         # --- START: NEW CACHING LOGIC ---
         # Create a canonical (sorted) key to represent the pair regardless of order.
+        # image_name1 = os.path.basename(image_path1)
+        # image_name2 = os.path.basename(image_path2)
+        
         canonical_key = tuple(sorted((image_path1, image_path2)))
         
         if canonical_key in tile_pair_cache:
@@ -373,8 +613,11 @@ def run_chunked_mast3r_matching(
                 overlapping_tile_pairs = [(b, a) for a, b in cached_pairs]
         else:
             # This is a new pair, we need to compute the overlaps.
+            # name1_base = os.path.splitext(os.path.basename(image_name1))[0]
+            # name2_base = os.path.splitext(os.path.basename(image_name2))[0]
             name1_base = os.path.splitext(os.path.basename(image_path1))[0]
             name2_base = os.path.splitext(os.path.basename(image_path2))[0]
+
             transform_1_to_2 = precomputed_transforms.get((name1_base, name2_base))
 
             # Important: Get inverse transform for symmetric calculation if needed.
@@ -390,6 +633,8 @@ def run_chunked_mast3r_matching(
 
             tiles1 = tile_cache[image_path1]
             tiles2 = tile_cache[image_path2]
+            # tiles1 = tile_cache[image_name1]
+            # tiles2 = tile_cache[image_name2]
             
             # Compute the tile pairs using our new one-to-one function.
             overlapping_tile_pairs = determine_overlapping_tile_pairs(tiles1, tiles2, transform_1_to_2)
@@ -404,7 +649,7 @@ def run_chunked_mast3r_matching(
         if not overlapping_tile_pairs: continue
 
         # Process all tile pairs for this image pair in batches
-        for i in tqdm(range(0, len(overlapping_tile_pairs), batch_size), desc="Matching Tile Pairs", total=(len(overlapping_tile_pairs) // batch_size), leave=False):
+        for i in tqdm(range(0, len(overlapping_tile_pairs), batch_size), desc="Matching Tile Pairs", total=len(overlapping_tile_pairs) // batch_size , leave=False, unit="pairs", unit_scale=1):
             batch_of_pairs = overlapping_tile_pairs[i:i + batch_size]
             
             # Create a LIST of TUPLES in the exact format `inference` expects.
@@ -496,6 +741,7 @@ def run_chunked_mast3r_matching(
                 kpts2_global = kpts2_local + offset_b
                 
                 pair_key = (image_path1, image_path2)
+                # pair_key = (image_name1, image_name2)
                 if pair_key not in aggregated_matches_temp:
                     aggregated_matches_temp[pair_key] = {"kpts0": [], "kpts1": []}
                 
@@ -505,7 +751,7 @@ def run_chunked_mast3r_matching(
     # --- START: NEW FINALIZATION STEP (THE FIX) ---
     print("Finalizing match aggregation...")
     aggregated_matches_final = {}
-    for pair_key, kpt_data in aggregated_matches_temp.items():
+    for pair_key, kpt_data in tqdm(aggregated_matches_temp.items(), total=len(aggregated_matches_temp), desc="Finalizing Matches", leave=False):
         # Check if any matches were actually found for this pair
         if not kpt_data["kpts0"]:
             continue
@@ -524,7 +770,7 @@ def run_chunked_mast3r_matching(
     # --- END: NEW FINALIZATION STEP (THE FIX) ---
     # torch.save(aggregated_matches_final, os.path.join(root_path, "aggregated_matches_final.pt"))
     # --- Part C: Deduplicate and Export ---
-    unique_kpts, indexed_matches = deduplicate_and_format_for_colmap(aggregated_matches_final, min_len_track=2)
+    unique_kpts, indexed_matches = deduplicate_and_format_for_colmap(aggregated_matches_final, min_len_track=3, distance_threshold=dedup_distance)
     
     # Logic adapted from the END of original `export_matches`
     print("Exporting final keypoints and matches to COLMAP database...")
@@ -545,7 +791,7 @@ def run_chunked_mast3r_matching(
     # Export indexed matches with a check to prevent duplicate pair entries.
     pairs_added_to_db = set()
 
-    for (path1, path2), matches in indexed_matches.items():
+    for (path1, path2), matches in tqdm(indexed_matches.items(), total=len(indexed_matches), desc="Exporting Matches", leave=False):
         rel_path1 = os.path.relpath(path1, root_path).replace('\\', '/')
         rel_path2 = os.path.relpath(path2, root_path).replace('\\', '/')
         
