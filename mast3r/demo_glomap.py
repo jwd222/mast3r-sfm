@@ -514,7 +514,7 @@ def get_reconstructed_scene_J(glomap_bin, outdir, gradio_delete_cache, model, re
 
     # 1. Setup paths and load pre-computed transforms
     root_path = os.path.commonpath(filelist)
-    TRANSFORMS_JSON_PATH = "/mnt/d/projects/wsl_projects/Projects/3_repo/mast3r/data/tobias/1/fp/image_transforms.json"
+    TRANSFORMS_JSON_PATH = "/mnt/c/Projects/wsl_projects/Projects/3_repo/mast3r/data/tobias/1/fp/image_transforms.json"
     with open(TRANSFORMS_JSON_PATH, 'r') as f:
         transform_data_loaded = json.load(f)
         precomputed_transforms = {
