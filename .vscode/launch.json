@@ -12,9 +12,11 @@
             "console": "integratedTerminal",
             "args": [
                 "--input_dir",
-                "/mnt/c/Projects/wsl_projects/Projects/3_repo/mast3r/data/tobias/6/images",
+                "/mnt/c/Projects/wsl_projects/Projects/3_repo/mast3r/data/tobias/1/images",
                 "--output_dir",
-                "/mnt/c/Projects/wsl_projects/Projects/3_repo/mast3r/data/tobias/6",
+                "/mnt/c/Projects/wsl_projects/Projects/3_repo/mast3r/data/tobias/1",
+                "--transforms_json",
+                "/mnt/c/Projects/wsl_projects/Projects/3_repo/mast3r/data/tobias/1/fp/image_transforms.json",
                 "--weights",
                 // "/mnt/c/Projects/wsl_projects/Projects/3_repo/aerial-megadepth/mast3r/checkpoints/checkpoint-aerial-mast3r.pth", // mast3r weights
                 // "/mnt/c/Projects/wsl_projects/Projects/3_repo/aerial-megadepth/mast3r/checkpoints/checkpoint-aerial-dust3r.pth", // dust3r weights
@@ -102,6 +104,96 @@
                 "--colmap_path",
                 "C:\\Projects\\wsl_projects\\Projects\\3_repo\\mast3r\\data\\3\\colmap\\sparse\\0",
             ]
+        },
+        // ===== 4-image experiments (frames 372-375, 6 undirected pairs) =====
+        // Common: input=images_4, transforms=tobias/1 JSON, dust3r weights, shared intrinsics, diagnostics ON.
+        // Compare: per_a vs all  (config 1 vs 3, both batch4);  batch 4 vs 8 (config 1 vs 2, OOM test).
+        // 768 tiles omitted: 512 already maxes VRAM.
+        {
+            "name": "test4: per_a  tile512 batch4",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "/mnt/c/Projects/wsl_projects/Projects/3_repo/mast3r/colmap_from_mast3r_demo.py",
+            "console": "integratedTerminal",
+            "args": [
+                "--input_dir",
+                "/mnt/c/Projects/wsl_projects/Projects/3_repo/mast3r/data/tobias/1/images_4",
+                "--output_dir",
+                "/mnt/c/Projects/wsl_projects/Projects/3_repo/mast3r/data/tobias/1/test_per_a_512_b4",
+                "--transforms_json",
+                "/mnt/c/Projects/wsl_projects/Projects/3_repo/mast3r/data/tobias/1/fp/image_transforms.json",
+                "--weights",
+                "/home/hssl77/models/checkpoint-aerial-dust3r_inference.pth",
+                "--shared_intrinsics",
+                "--pair_diagnostics",
+                "--tile_pairing",
+                "per_a",
+                "--tile_size",
+                "512",
+                "512",
+                "--overlap_px",
+                "128",
+                "--batch_size",
+                "4"
+            ]
+        },
+        {
+            "name": "test4: per_a  tile512 batch8",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "/mnt/c/Projects/wsl_projects/Projects/3_repo/mast3r/colmap_from_mast3r_demo.py",
+            "console": "integratedTerminal",
+            "args": [
+                "--input_dir",
+                "/mnt/c/Projects/wsl_projects/Projects/3_repo/mast3r/data/tobias/1/images_4",
+                "--output_dir",
+                "/mnt/c/Projects/wsl_projects/Projects/3_repo/mast3r/data/tobias/1/test_per_a_512_b8",
+                "--transforms_json",
+                "/mnt/c/Projects/wsl_projects/Projects/3_repo/mast3r/data/tobias/1/fp/image_transforms.json",
+                "--weights",
+                "/home/hssl77/models/checkpoint-aerial-dust3r_inference.pth",
+                "--shared_intrinsics",
+                "--pair_diagnostics",
+                "--tile_pairing",
+                "per_a",
+                "--tile_size",
+                "512",
+                "512",
+                "--overlap_px",
+                "128",
+                "--batch_size",
+                "8"
+            ]
+        },
+        {
+            "name": "test4: all    tile512 batch4",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "/mnt/c/Projects/wsl_projects/Projects/3_repo/mast3r/colmap_from_mast3r_demo.py",
+            "console": "integratedTerminal",
+            "args": [
+                "--input_dir",
+                "/mnt/c/Projects/wsl_projects/Projects/3_repo/mast3r/data/tobias/1/images_4",
+                "--output_dir",
+                "/mnt/c/Projects/wsl_projects/Projects/3_repo/mast3r/data/tobias/1/test_all_512_b4",
+                "--transforms_json",
+                "/mnt/c/Projects/wsl_projects/Projects/3_repo/mast3r/data/tobias/1/fp/image_transforms.json",
+                "--weights",
+                "/home/hssl77/models/checkpoint-aerial-dust3r_inference.pth",
+                "--shared_intrinsics",
+                "--pair_diagnostics",
+                "--tile_pairing",
+                "all",
+                "--tile_size",
+                "512",
+                "512",
+                "--overlap_px",
+                "128",
+                "--batch_size",
+                "4"
+            ]
         }
+        // 768 tile configs removed: 512 already maxes VRAM, 768 (~2.25x activations) would OOM.
+        // batch8 is kept only on per_a (config 2) as an OOM-boundary test; "all" uses batch4 to stay safe.
     ]
 }

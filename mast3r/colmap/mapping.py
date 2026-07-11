@@ -7,6 +7,7 @@
 import pycolmap
 import os
 import os.path as path
+import time
 import kapture.io
 import kapture.io.csv
 import subprocess
@@ -157,9 +158,8 @@ def _glomap_run_mapper(glomap_bin, colmap_db_path, recon_path, image_root_path):
             '\nSubprocess Error (Return code:'
             f' {glomap_process.returncode} )')
         
-def glomap_run_mapper(glomap_bin, colmap_db_path, recon_path, image_root_path, options=None):
+def glomap_run_mapper(glomap_bin, colmap_db_path, recon_path, image_root_path, options=None, timeout=None):
     """
-    MODIFIED VERSION.
     Runs the GLOMAP mapper with added flexibility to pass custom options.
 
     Args:
@@ -171,9 +171,13 @@ def glomap_run_mapper(glomap_bin, colmap_db_path, recon_path, image_root_path, o
                                   to pass to GLOMAP, e.g.,
                                   {"--TrackEstablishment.min_track_length": "2"}.
                                   Defaults to None.
+        timeout (float, optional): Maximum wall-clock seconds to wait for GLOMAP.
+                                   If exceeded the process is killed and a
+                                   ``TimeoutError`` is raised. ``None`` waits forever
+                                   (audit M9).
     """
     print("running mapping with custom options...")
-    
+
     # --- Base arguments required for any run ---
     args = [
         glomap_bin,
@@ -193,20 +197,26 @@ def glomap_run_mapper(glomap_bin, colmap_db_path, recon_path, image_root_path, o
             args.append(option)
             if value is not None and str(value) != "":
                 args.append(str(value))
-    
+
     print(f"Executing GLOMAP with command: {' '.join(args)}")
 
     # --- Run the subprocess ---
     glomap_process = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    assert glomap_process.stdout is not None
 
-    # Print output in real-time
+    # Print output in real-time, with an optional hard timeout (audit M9).
+    deadline = time.monotonic() + timeout if timeout is not None else None
     while True:
         output = glomap_process.stdout.readline()
         if output == '' and glomap_process.poll() is not None:
             break
         if output:
             print(output.strip())
-            
+        if deadline is not None and time.monotonic() > deadline:
+            glomap_process.kill()
+            raise TimeoutError(
+                f'\nGLOMAP exceeded the timeout of {timeout}s and was killed.')
+
     return_code = glomap_process.poll()
 
     if return_code != 0:
@@ -222,7 +232,6 @@ def colmap_run_incremental_mapper(
     custom_options: dict = None # Allows for advanced user overrides
 ):
     """
-    CORRECTED and FINAL VERSION using the precise pycolmap API.
     Runs the COLMAP incremental mapper with a configuration highly optimized
     for challenging, low-parallax aerial datasets.
 
@@ -231,27 +240,40 @@ def colmap_run_incremental_mapper(
         image_path (str): Path to the root directory containing the images.
         output_path (str): Path to the directory where the reconstruction will be saved.
         custom_options (dict, optional): Dictionary to override any specific option.
+
+    Returns:
+        tuple: (reconstruction, reconstruction_id) where reconstruction_id is the
+               on-disk sub-directory name (e.g. '0') of the returned reconstruction.
+               Callers should copy ``output_path/reconstruction_id`` rather than a
+               hard-coded ``reconstruction/0`` (see audit C4).
     """
     print("Running COLMAP's incremental mapper with optimized aerial settings...")
-    
+
     # --- Step 1: Instantiate the top-level options class ---
     # This is the main configuration object for the entire pipeline.
     options = pycolmap.IncrementalPipelineOptions()
 
+    # Only ever write a single reconstruction to disk. Combined with returning the
+    # actual reconstruction id (below) this removes the ambiguity where the largest
+    # model could be written to reconstruction/1 while callers copied reconstruction/0.
+    options.multiple_models = False
+
     # --- Step 2: Set the nested Triangulation options ---
     # These options control how 3D points are created from 2D matches.
-    
+
     # CRITICAL FIX 1: Allow two-view tracks.
     # The default (`True`) ignores all matches from a 2-view scene. We must set it to `False`.
+    # NOTE: this must stay consistent with `min_len_track` in the chunked matcher (audit H2).
+    # With min_len_track=2 two-view tracks exist in the DB, so this flag must remain False.
     options.triangulation.ignore_two_view_tracks = False
-    
+
     # CRITICAL FIX 2: Lower the minimum triangulation angle.
     # The default (1.5 degrees) is too strict for low-parallax aerial data.
     options.triangulation.min_angle = 0.005
 
     # --- Step 3: Set the nested Mapper options ---
     # These options control the main SfM process: initialization, filtering, etc.
-    
+
     # Also lower the post-bundle-adjustment filter to be consistent with the triangulation setting.
     options.mapper.filter_min_tri_angle = 0.005
 
@@ -278,19 +300,28 @@ def colmap_run_incremental_mapper(
         output_path=output_path,
         options=options
     )
-    
+
     if not reconstructions:
         raise RuntimeError("Incremental mapping failed to produce a reconstruction.")
-    
+
     print(f"Successfully created {len(reconstructions)} reconstruction(s).")
-    
+
     # Find and return the largest reconstruction (most images registered).
     largest_recon_id = max(reconstructions, key=lambda rid: reconstructions[rid].num_reg_images())
-    
-    return reconstructions[largest_recon_id]
+
+    return reconstructions[largest_recon_id], largest_recon_id
 
 
 def kapture_import_image_folder_or_list(images_path: Union[str, Tuple[str, List[str]]], use_single_camera=False) -> kapture.Kapture:
+    """
+    Build a kapture dataset from an image folder or an explicit (root, list) pair.
+
+    Note on ``use_single_camera`` (the ``--shared_intrinsics`` path, audit L9):
+    when False (default) a *separate* camera is created for every image, which
+    over-parameterizes intrinsics for a single-camera aerial strip. Pass
+    ``use_single_camera=True`` to share one camera across all images of identical
+    dimensions; heterogeneous resolutions then raise an AssertionError.
+    """
     images = kapture.RecordsCamera()
 
     if isinstance(images_path, str):

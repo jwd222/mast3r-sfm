@@ -1,0 +1,257 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Tile Overlap & Matching Coverage</title>
+<style>
+  :root{
+    --img1:#2563eb; --img1bg:#dbeafe;
+    --img2:#ea580c; --img2bg:#ffedd5;
+    --cover:#16a34a; --gap:#dc2626;
+    --overlap:#fde68a;
+    --ink:#1f2937; --muted:#6b7280;
+  }
+  *{box-sizing:border-box}
+  body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    color:var(--ink); margin:0 auto; padding:32px; line-height:1.55; max-width:1080px}
+  h1{font-size:1.7rem; margin-bottom:.2em}
+  h2{font-size:1.2rem; margin-top:2em; border-bottom:2px solid #e5e7eb; padding-bottom:.3em}
+  .lead{color:var(--muted); max-width:82ch}
+  .panel{background:#fff; border:1px solid #e5e7eb; border-radius:10px;
+    padding:18px 18px 8px; margin:18px 0; box-shadow:0 1px 2px rgba(0,0,0,.04)}
+  .panel > svg{width:100%; height:auto; display:block}
+  .legend{display:flex; flex-wrap:wrap; gap:14px 22px; font-size:.9rem; margin:10px 2px}
+  .legend span{display:inline-flex; align-items:center; gap:7px}
+  .swatch{width:16px; height:16px; border-radius:3px; border:1px solid rgba(0,0,0,.15)}
+  .note{background:#f9fafb; border-left:4px solid var(--img1); padding:10px 14px; border-radius:0 6px 6px 0; margin:12px 0}
+  .note.gap{border-left-color:var(--gap)}
+  table{border-collapse:collapse; width:100%; margin:12px 0; font-size:.92rem}
+  th,td{border:1px solid #e5e7eb; padding:7px 10px; text-align:left}
+  th{background:#f3f4f6}
+  code{background:#f3f4f6; padding:1px 5px; border-radius:4px; font-size:.9em}
+  .tip{background:#eff6ff; border:1px solid #bfdbfe; border-radius:8px; padding:12px 16px; margin:14px 0}
+  ol.pointer li{margin:6px 0}
+  .axislbl{font-size:11px; fill:var(--muted)}
+  .kv{font-weight:700}
+</style>
+</head>
+<body>
+
+<h1>How tiling covers the image overlap — and where best-B-per-A matching can miss pixels</h1>
+<p class="lead">
+  Two consecutive aerial frames are each cut into <b>overlapping</b> tiles, MASt3R is run on
+  <i>pairs of tiles</i>, and the question is whether the whole ground-overlap gets matched. The
+  default strategy <code>--tile_pairing per_a</code> matches each tile of image A to its single
+  best-overlap tile in image B (B may be reused; no "stealing"). It is fast and near-complete, but
+  it is <b>not</b> fully gap-free. The only fully gap-free option is <code>--tile_pairing all</code>
+  (many-to-many), at ~3–4× the inference cost.
+</p>
+
+<div class="legend">
+  <span><i class="swatch" style="background:var(--img1)"></i> Image&nbsp;1 tile (A)</span>
+  <span><i class="swatch" style="background:var(--img2)"></i> Image&nbsp;2 tile (B)</span>
+  <span><i class="swatch" style="background:var(--overlap)"></i> Overlap region R</span>
+  <span><i class="swatch" style="background:var(--cover)"></i> Pixels that get matched</span>
+  <span><i class="swatch" style="background:var(--gap)"></i> Pixels left UNMATCHED (gap)</span>
+</div>
+
+<div class="note">
+  <b>Key fact about the tiling (this is easy to get backwards):</b> tiles <i>within the same image</i>
+  overlap each other, not just at the edges. With tile&nbsp;512 and <code>overlap_px=128</code> the stride
+  is <code>512−128 = 384</code>, so every neighbouring pair of tiles shares a 128&nbsp;px strip
+  (the edge-aligned last tile shares even more). So <b>B1 and B2 do overlap each other</b>, and an A
+  tile can straddle several B tiles at once.
+</div>
+
+<!-- ===================== PANEL 1: 2D OVERVIEW ===================== -->
+<h2>1. The setup — two overlapping images, each fully tiled</h2>
+<p>
+  Each frame is divided into a grid of overlapping tiles, so <b>every pixel of each image belongs to
+  at least one tile</b> — the tiling is a complete cover. The two frames share a ground
+  <b>overlap region R</b> (yellow). The diagrams below take a <b>1-D slice</b> through R; the same
+  logic holds in 2-D with more tiles.
+</p>
+<div class="panel">
+<svg viewBox="0 0 700 260" role="img" aria-label="Two overlapping images, each tiled">
+  <rect x="250" y="40" width="80" height="170" fill="var(--overlap)" opacity="0.55"/>
+  <text x="290" y="32" text-anchor="middle" font-size="12" font-weight="700" fill="#92400e">overlap R</text>
+  <rect x="50" y="40" width="280" height="170" fill="var(--img1bg)" stroke="var(--img1)" stroke-width="2"/>
+  <g stroke="var(--img1)" stroke-width="1" stroke-dasharray="4 3" opacity="0.7">
+    <line x1="143" y1="40" x2="143" y2="210"/><line x1="237" y1="40" x2="237" y2="210"/>
+    <line x1="50" y1="125" x2="330" y2="125"/></g>
+  <text x="190" y="60" text-anchor="middle" font-size="13" font-weight="700" fill="var(--img1)">Image 1 (tiled into A)</text>
+  <rect x="330" y="40" width="280" height="170" fill="var(--img2bg)" stroke="var(--img2)" stroke-width="2"/>
+  <g stroke="var(--img2)" stroke-width="1" stroke-dasharray="4 3" opacity="0.7">
+    <line x1="423" y1="40" x2="423" y2="210"/><line x1="517" y1="40" x2="517" y2="210"/>
+    <line x1="330" y1="125" x2="610" y2="125"/></g>
+  <text x="470" y="60" text-anchor="middle" font-size="13" font-weight="700" fill="var(--img2)">Image 2 (tiled into B)</text>
+</svg>
+</div>
+
+<!-- ===================== PANEL 2: 1D CROSS-SECTION ===================== -->
+<h2>2. The 1-D slice through the overlap (the key diagram)</h2>
+<p>
+  Horizontal axis = world pixel position; only the overlap window <code>R = [640, 1280]</code> is shown.
+  Two A tiles (A2, A3) and two B tiles (B1, B2) cover it. Because tiles overlap within each image,
+  A3 straddles both B1 and B2.
+</p>
+<div class="panel">
+<svg viewBox="0 0 660 420" role="img" aria-label="1-D cross section of tile coverage">
+  <rect x="116" y="20" width="448" height="385" fill="var(--overlap)" opacity="0.30"/>
+  <text x="340" y="14" text-anchor="middle" font-size="11" font-weight="700" fill="#92400e">overlap region R  =  [640 … 1280] px</text>
+
+  <!-- AXIS -->
+  <line x1="60" y1="48" x2="620" y2="48" stroke="var(--ink)" stroke-width="1"/>
+  <g class="axislbl" text-anchor="middle">
+    <g><line x1="116" y1="44" x2="116" y2="52" stroke="var(--ink)"/><text x="116" y="62">640</text></g>
+    <g><line x1="206" y1="44" x2="206" y2="52" stroke="var(--ink)"/><text x="206" y="62">768</text></g>
+    <g><line x1="295" y1="44" x2="295" y2="52" stroke="var(--ink)"/><text x="295" y="62">896</text></g>
+    <g><line x1="385" y1="44" x2="385" y2="52" stroke="var(--ink)"/><text x="385" y="62">1024</text></g>
+    <g><line x1="474" y1="44" x2="474" y2="52" stroke="var(--ink)"/><text x="474" y="62">1152</text></g>
+    <g><line x1="564" y1="44" x2="564" y2="52" stroke="var(--ink)"/><text x="564" y="62">1280</text></g>
+  </g>
+  <text x="340" y="78" text-anchor="middle" class="axislbl">world pixel position →</text>
+
+  <!-- IMG1 TILES -->
+  <text x="56" y="104" text-anchor="end" font-size="12" font-weight="700" fill="var(--img1)">img1 tiles</text>
+  <rect x="60" y="92" width="235" height="24" fill="var(--img1)" opacity="0.85" rx="3"/>
+  <text x="150" y="108" text-anchor="middle" font-size="11" fill="#fff" font-weight="700">A2  [384 … 896]</text>
+  <rect x="206" y="120" width="358" height="24" fill="var(--img1)" opacity="0.85" rx="3"/>
+  <text x="385" y="136" text-anchor="middle" font-size="11" fill="#fff" font-weight="700">A3  [768 … 1280]</text>
+
+  <!-- IMG2 TILES -->
+  <text x="56" y="166" text-anchor="end" font-size="12" font-weight="700" fill="var(--img2)">img2 tiles</text>
+  <rect x="116" y="154" width="358" height="24" fill="var(--img2)" opacity="0.85" rx="3"/>
+  <text x="295" y="170" text-anchor="middle" font-size="11" fill="#fff" font-weight="700">B1  [640 … 1152]</text>
+  <rect x="385" y="182" width="235" height="24" fill="var(--img2)" opacity="0.85" rx="3"/>
+  <text x="500" y="198" text-anchor="middle" font-size="11" fill="#fff" font-weight="700">B2  [1024 … 1536]</text>
+
+  <line x1="40" y1="222" x2="620" y2="222" stroke="#d1d5db" stroke-dasharray="2 4"/>
+
+  <!-- A∩B INTERSECTIONS -->
+  <text x="56" y="244" text-anchor="end" font-size="12" font-weight="700" fill="var(--ink)">what each</text>
+  <text x="56" y="258" text-anchor="end" font-size="12" font-weight="700" fill="var(--ink)">pair covers</text>
+  <rect x="116" y="240" width="179" height="15" fill="var(--cover)" opacity="0.55" stroke="var(--cover)" rx="2"/>
+  <text x="205" y="251" text-anchor="middle" font-size="10" fill="#14532d">A2∩B1 = [640…896]</text>
+  <rect x="206" y="258" width="268" height="15" fill="var(--cover)" opacity="0.55" stroke="var(--cover)" rx="2"/>
+  <text x="340" y="269" text-anchor="middle" font-size="10" fill="#14532d">A3∩B1 = [768…1152]</text>
+  <rect x="385" y="276" width="179" height="15" fill="var(--cover)" opacity="0.55" stroke="var(--cover)" rx="2"/>
+  <text x="474" y="287" text-anchor="middle" font-size="10" fill="#14532d">A3∩B2 = [1024…1280]</text>
+
+  <!-- per_a RESULT -->
+  <text x="56" y="318" text-anchor="end" font-size="12" font-weight="700" fill="var(--ink)">per_a</text>
+  <text x="56" y="332" text-anchor="end" font-size="10" fill="var(--muted)">A2→B1, A3→B1 (B reused)</text>
+  <rect x="116" y="312" width="358" height="26" fill="var(--cover)" rx="3"/>
+  <pattern id="hatch" patternUnits="userSpaceOnUse" width="6" height="6" patternTransform="rotate(45)">
+    <rect width="6" height="6" fill="var(--gap)"/><line x1="0" y1="0" x2="0" y2="6" stroke="#fff" stroke-width="2"/></pattern>
+  <rect x="474" y="312" width="90" height="26" fill="var(--gap)" rx="3"/>
+  <rect x="474" y="312" width="90" height="26" fill="url(#hatch)" opacity="0.6" rx="3"/>
+  <text x="519" y="329" text-anchor="middle" font-size="10" fill="#fff" font-weight="700">GAP</text>
+
+  <!-- all RESULT -->
+  <text x="56" y="372" text-anchor="end" font-size="12" font-weight="700" fill="var(--ink)">all</text>
+  <text x="56" y="386" text-anchor="end" font-size="10" fill="var(--muted)">also run A3–B2</text>
+  <rect x="116" y="366" width="448" height="26" fill="var(--cover)" rx="3"/>
+  <text x="340" y="383" text-anchor="middle" font-size="11" fill="#fff" font-weight="700">whole R covered (no gap)</text>
+</svg>
+</div>
+
+<div class="note gap">
+  <b>Read the bottom two rows.</b> <code>per_a</code> matches A2 and A3 each to their best B (= B1),
+  so it covers [640…1152] but leaves a <b>GAP at [1152…1280]</b> — the right tail of A3 that only
+  reaches B2, and (A3,B2) was not run. <code>all</code> also runs A3–B2, filling the gap, but at
+  ~3–4× the inferences.
+</div>
+
+<!-- ===================== PANEL 3: ZOOM ON THE GAP ===================== -->
+<h2>3. Zooming into the gap — why those pixels are missed</h2>
+<p>
+  Pixels in <code>[1152, 1280]</code> lie in <b>A3 only</b> (Image&nbsp;1) and <b>B2 only</b>
+  (Image&nbsp;2). Matching them <i>requires</i> the pair <b>(A3, B2)</b>. But <code>per_a</code> chose
+  A3's best overlap = B1, so (A3, B2) is never run → those pixels get no correspondence in this pair.
+</p>
+<div class="panel">
+<svg viewBox="0 0 660 230" role="img" aria-label="Zoom on the unmatched gap">
+  <rect x="40" y="20" width="580" height="190" fill="#fff" stroke="#e5e7eb"/>
+  <!-- gap window 1152..1280 -->
+  <rect x="194" y="30" width="154" height="170" fill="var(--gap)" opacity="0.10"/>
+
+  <!-- A3 covers the gap (img1) -->
+  <text x="48" y="62" font-size="12" font-weight="700" fill="var(--img1)">A3 (img1)</text>
+  <rect x="60" y="48" width="288" height="26" fill="var(--img1)" opacity="0.85" rx="3"/>
+  <text x="180" y="65" text-anchor="middle" font-size="11" fill="#fff">A3  [768 … 1280]</text>
+
+  <!-- B1 ends at 1152, B2 covers the gap (img2) -->
+  <text x="48" y="110" font-size="12" font-weight="700" fill="var(--img2)">B1 (img2)</text>
+  <rect x="60" y="96" width="134" height="26" fill="var(--img2)" opacity="0.85" rx="3"/>
+  <text x="125" y="113" text-anchor="middle" font-size="10" fill="#fff">B1 …1152</text>
+  <text x="48" y="158" font-size="12" font-weight="700" fill="var(--img2)">B2 (img2)</text>
+  <rect x="194" y="144" width="300" height="26" fill="var(--img2)" opacity="0.85" rx="3"/>
+  <text x="344" y="161" text-anchor="middle" font-size="11" fill="#fff">B2  [1024 … 1536]</text>
+
+  <!-- gap markers -->
+  <line x1="194" y1="40" x2="194" y2="185" stroke="var(--gap)" stroke-dasharray="3 3"/>
+  <line x1="348" y1="40" x2="348" y2="185" stroke="var(--gap)" stroke-dasharray="3 3"/>
+  <text x="271" y="40" text-anchor="middle" font-size="11" font-weight="700" fill="var(--gap)">gap [1152 … 1280]</text>
+
+  <!-- point P -->
+  <circle cx="271" cy="190" r="7" fill="#111827"/>
+  <text x="283" y="194" font-size="12" font-weight="700">point P</text>
+
+  <!-- verdict -->
+  <rect x="430" y="176" width="180" height="40" fill="#fef2f2" stroke="var(--gap)" rx="6"/>
+  <text x="520" y="193" text-anchor="middle" font-size="11" font-weight="700" fill="var(--gap)">pair (A3, B2)</text>
+  <text x="520" y="208" text-anchor="middle" font-size="11" font-weight="700" fill="var(--gap)">NOT run → P unmatched</text>
+</svg>
+</div>
+
+<!-- ===================== HOW TO READ ===================== -->
+<h2>How to read these diagrams (pointers)</h2>
+<ol class="pointer">
+  <li><b>Bars are pixel ranges.</b> <code>A3&nbsp;[768…1280]</code> means tile A3 spans those world
+      pixels. Where an A bar and a B bar overlap in <i>x</i> is the region that tile-pair could match
+      (the green <code>A∩B</code> bars).</li>
+  <li><b>A matched pair only covers <code>A∩B</code>.</b> Running MASt3R on (A,B) gives correspondences
+      only for the slice where both tiles' footprints overlap — not all of A, not all of B.</li>
+  <li><b><code>per_a</code> = one B per A.</b> Each A tile is matched to its single highest-overlap B
+      (B may be reused). So A3, whose best overlap is B1, is run against B1 only — never B2. The part
+      of A3 that lies over B2 ([1152…1280]) therefore has no pair covering it.</li>
+  <li><b>The gap is a spill sliver.</b> It appears wherever an A tile straddles a B-grid boundary and
+      "spills" into a B tile it did not pick. With overlapping tiling that can happen at internal
+      boundaries; the sliver is ~one tile-overlap wide (≤128&nbsp;px).</li>
+  <li><b>Only <code>all</code> is gap-free.</b> It runs every (A,B) the two tiles overlap, so any
+      point P (in some A and some B) has its pair run. Cost: ~3–4× more inferences, mostly redundant
+      after dedup.</li>
+  <li><b>Why <code>per_a</code> is still fine in practice.</b> The same ground is matched in other
+      image pairs (img1↔img3, …); with <code>min_len_track=2</code> a point only needs to survive in
+      one pair. Thin seam slivers are largely recovered across pairs.</li>
+</ol>
+
+<!-- ===================== SUMMARY ===================== -->
+<h2>Trade-off summary</h2>
+<table>
+  <tr><th>Strategy</th><th>Coverage of overlap</th><th>Tile inferences</th><th>When to use</th></tr>
+  <tr>
+    <td><code>--tile_pairing per_a</code> <b>(default)</b></td>
+    <td>Every A tile matched to its best B; thin ≤128&nbsp;px spill slivers can be unmatched in a given pair (recovered across pairs)</td>
+    <td>~1 per A tile (fast)</td>
+    <td>Normal aligned strips; fast runs</td>
+  </tr>
+  <tr>
+    <td><code>--tile_pairing all</code></td>
+    <td>Complete — every overlapping tile combination is matched (no gap)</td>
+    <td>~3–4× more (slow, mostly redundant after dedup)</td>
+    <td>Only if a dataset shows visible holes / dropped seams</td>
+  </tr>
+</table>
+
+<div class="tip">
+  <b>Practical guidance:</b> keep <code>per_a</code> (the default). It matches your "one best B per A,
+  no stealing" idea — fast, no dropped A tiles, and the residual seam slivers are recovered by
+  cross-pair redundancy across the image graph. Switch to <code>all</code> only if a specific dataset
+  shows visible holes/dropped seams in the reconstruction.
+</div>
+
+</body>
+</html>

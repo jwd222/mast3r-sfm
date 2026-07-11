@@ -9,11 +9,7 @@ import json
 import cv2
 from torchvision import transforms
 from collections import defaultdict
-from itertools import combinations # We need this for creating pairs
-from multiprocessing import Pool
-import time
-# import cupy as cp
-# import cupyx.scipy.spatial  # CuPy's scipy-compatible KD-Tree
+from itertools import combinations  # needed for creating pairwise matches within a track
 
 # You will need these helper functions from the original mast3r repository's utils.
 # Make sure they are available in your Python path.
@@ -67,6 +63,14 @@ class DisjointSet:
         """
         Merges the sets containing i and j, ONLY IF the merge is valid
         (i.e., they do not share any common image paths).
+
+        Known trade-off (audit M6): enforcing "one keypoint per image per track"
+        transitively can reject a merge that would otherwise have been fine, which
+        fragments tracks. The shorter resulting tracks may then fall below
+        ``min_len_track`` and be dropped, thinning the SfM graph. A nearest-
+        representative selection strategy could recover some of these merges, but
+        that requires per-dataset benchmarking; the conservative reject behavior is
+        kept here for correctness.
         """
         root_i = self.find(i)
         root_j = self.find(j)
@@ -89,12 +93,6 @@ class DisjointSet:
     
     def get_all_subsets(self):
         """Returns all the disjoint sets as a list of lists."""
-        subsets = defaultdict(list)
-        for item in self.parent:
-            root = self.find(item)
-            subsets[root].append(item)
-        return list(subsets.values())
-    def get_all_subsets(self):
         subsets = defaultdict(list)
         for item in self.parent:
             root = self.find(item)
@@ -123,33 +121,6 @@ def _cluster_keypoints(aggregated_matches):
         _, unique_indices = np.unique(all_kpts, axis=0, return_index=True)
         unique_kpts_per_image[path] = all_kpts[unique_indices]
         
-    return unique_kpts_per_image
-
-
-def __cluster_keypoints(aggregated_matches, cluster_distance=2.0):
-    print("Step 1: Clustering keypoints with GPU...")
-    all_kpts_per_image = defaultdict(list)
-    
-    for (path_A, path_B), match_data in aggregated_matches.items():
-        all_kpts_per_image[path_A].append(match_data["kpts0"])
-        all_kpts_per_image[path_B].append(match_data["kpts1"])
-
-    unique_kpts_per_image = {}
-    for path, kpt_list in all_kpts_per_image.items():
-        if not kpt_list: continue
-        all_kpts = np.concatenate(kpt_list, axis=0)
-        all_kpts_gpu = cp.asarray(all_kpts)
-        
-        tree = cupyx.scipy.spatial.KDTree(all_kpts_gpu)
-        pairs = tree.query_pairs(r=cluster_distance, output_type='ndarray')
-        if len(pairs) > 0:
-            keep_indices = cp.setdiff1d(cp.arange(len(all_kpts_gpu)), pairs[:, 1])
-            unique_kpts = cp.asnumpy(all_kpts_gpu[keep_indices])
-        else:
-            unique_kpts = cp.asnumpy(all_kpts_gpu)
-        
-        unique_kpts_per_image[path] = unique_kpts
-    
     return unique_kpts_per_image
 
 
@@ -214,53 +185,6 @@ def _build_and_merge_tracks_tmp(aggregated_matches, unique_kpts_per_image, dista
                 # A "point" is uniquely identified by its image path and its index within that image
                 point_A = (path_A, idx_A)
                 point_B = (path_B, idx_B)
-                dsu.union(point_A, point_B)
-                
-    return dsu.get_all_subsets()
-
-def __build_and_merge_tracks(aggregated_matches, unique_kpts_per_image, distance_threshold):
-    """
-    Step 2: Builds tracks from pairwise matches and merges them using a DisjointSet.
-    Optimized with GPU-accelerated KD-Tree queries and early deduplication.
-    """
-    print("Step 2: Building and merging tracks with GPU KD-Tree...")
-    dsu = DisjointSet()
-    
-    # Pre-build k-d trees on GPU
-    trees = {path: cupyx.scipy.spatial.KDTree(cp.asarray(kpts)) for path, kpts in unique_kpts_per_image.items()}
-
-    for (path_A, path_B), match_data in aggregated_matches.items():
-        if path_A not in trees or path_B not in trees:
-            continue
-            
-        # Move keypoints to GPU
-        kpts0_gpu = cp.asarray(match_data["kpts0"])
-        kpts1_gpu = cp.asarray(match_data["kpts1"])
-        
-        # Find the unique index for each raw keypoint in the match
-        _, indices_A = trees[path_A].query(kpts0_gpu, distance_upper_bound=distance_threshold)
-        _, indices_B = trees[path_B].query(kpts1_gpu, distance_upper_bound=distance_threshold)
-        
-        # Move indices back to CPU for DSU processing
-        indices_A = cp.asnumpy(indices_A)
-        indices_B = cp.asnumpy(indices_B)
-        
-        # Group matches by unique keypoint indices to deduplicate within each image pair
-        matches_by_index = {}
-        for i in range(len(indices_A)):
-            idx_A, idx_B = indices_A[i], indices_B[i]
-            if idx_A < len(unique_kpts_per_image[path_A]) and idx_B < len(unique_kpts_per_image[path_B]):
-                match_key = (idx_A, idx_B)
-                if match_key not in matches_by_index:
-                    matches_by_index[match_key] = ((path_A, idx_A), (path_B, idx_B))
-        
-        # Perform union operations with image-based deduplication
-        for (idx_A, idx_B), (point_A, point_B) in matches_by_index.items():
-            root_A = dsu.find(point_A)
-            root_B = dsu.find(point_B)
-            set_A_images = dsu.image_sets.get(root_A, {point_A[0]})
-            set_B_images = dsu.image_sets.get(root_B, {point_B[0]})
-            if point_A[0] not in set_B_images and point_B[0] not in set_A_images:
                 dsu.union(point_A, point_B)
                 
     return dsu.get_all_subsets()
@@ -404,84 +328,33 @@ def _filter_and_finalize(all_tracks, unique_kpts_per_image, min_len_track):
     return final_keypoints_np, final_matches_indexed_np
 
 
-def __filter_and_finalize(all_tracks, unique_kpts_per_image, min_len_track):
-    print("Step 3: Filtering tracks and finalizing with GPU pair generation...")
-    final_keypoints = defaultdict(list)
-    final_matches_indexed = defaultdict(list)
-    point_to_new_idx = {}
-    
-    # Convert tracks to GPU for pair generation
-    def generate_pairs_gpu(track):
-        track_images = {path for path, idx in track}
-        if len(track_images) < min_len_track:
-            return None, None
-        
-        representative_points = {}
-        for path, old_idx in track:
-            if path not in representative_points:
-                representative_points[path] = (path, old_idx)
-        clean_track = list(representative_points.values())
-        
-        # Generate pairs on GPU
-        track_array = cp.array([(path, idx) for path, idx in clean_track], dtype=object)
-        pairs = []
-        for i in range(len(track_array)):
-            for j in range(i + 1, len(track_array)):
-                pairs.append((track_array[i], track_array[j]))
-        return clean_track, cp.array(pairs, dtype=object)
-    
-    # Process tracks on GPU
-    all_clean_tracks = []
-    all_pairs = []
-    for track in tqdm(all_tracks, desc="Processing Tracks", total=len(all_tracks)):
-        clean_track, pairs = generate_pairs_gpu(track)
-        if clean_track:
-            all_clean_tracks.append(clean_track)
-            all_pairs.append(cp.asnumpy(pairs))
-    
-    # CPU processing for index assignment and match finalization
-    for clean_track, pairs in zip(all_clean_tracks, all_pairs):
-        for path, old_idx in clean_track:
-            point_id = (path, old_idx)
-            if point_id not in point_to_new_idx:
-                new_idx = len(final_keypoints[path])
-                point_to_new_idx[point_id] = new_idx
-                kpt_coords = unique_kpts_per_image[path][old_idx]
-                final_keypoints[path].append(kpt_coords)
-        
-        for point1, point2 in pairs:
-            path1, _ = point1
-            path2, _ = point2
-            new_idx1 = point_to_new_idx[tuple(point1)]
-            new_idx2 = point_to_new_idx[tuple(point2)]
-            if path1 > path2:
-                path1, path2 = path2, path1
-                new_idx1, new_idx2 = new_idx2, new_idx1
-            final_matches_indexed[(path1, path2)].append([new_idx1, new_idx2])
-    
-    final_keypoints_np = {path: np.array(kpts) for path, kpts in final_keypoints.items()}
-    final_matches_indexed_np = {pair: np.array(matches) for pair, matches in final_matches_indexed.items()}
-    
-    return final_keypoints_np, final_matches_indexed_np
-
-def extract_matches_from_tile_prediction(pred1, pred2, shape1, shape2, conf_thr=3.0, device='cuda'):
+def extract_matches_from_tile_prediction(pred1, pred2, shape1, shape2, conf_thr=1.5, device='cuda',
+                                         kpt_stride=8):
     """
-    CORRECTED VERSION.
-    This function takes the raw output of the DUSt3R model for a SINGLE tile pair
-    and extracts the 2D-2D point correspondences in their local tile coordinates.
-    It uses the 'pts3d' and 'conf' keys.
+    Extracts 2D-2D point correspondences (in local tile coordinates) from the raw
+    DUSt3R/MASt3R prediction for a SINGLE tile pair, using the dense 3D-point-map
+    path (``pts3d`` + ``conf``).
+
+    Design note (audit H3/H4): the chunked matcher intentionally uses the dense
+    3D-point matching path rather than MASt3R's learned descriptor head
+    (``desc``/``desc_conf``). ``conf_thr`` is therefore applied to the raw pointmap
+    ``conf`` (whose scale differs from descriptor confidence), NOT to ``desc_conf``.
+    The previous default of 3.0 was tuned for ``desc_conf`` and was far too strict
+    for raw ``conf``; 1.5 is a more appropriate default for the 3D-point path but
+    should be validated per dataset (exposed as a CLI flag by the orchestrator).
 
     Args:
         pred1 (dict): The model's prediction for the first tile.
         pred2 (dict): The model's prediction for the second tile.
         shape1 (torch.Size): The (H, W) shape of the first tile tensor.
         shape2 (torch.Size): The (H, W) shape of the second tile tensor.
-        conf_thr (float): The confidence threshold to filter keypoints.
+        conf_thr (float): Confidence threshold applied to raw pointmap ``conf``.
         device (str): The device to use for calculations.
 
     Returns:
         tuple: A tuple containing (matches_im0, matches_im1), numpy arrays of
-               shape (N, 2) with keypoint coordinates local to their tile.
+               shape (N, 2) with keypoint coordinates local to their tile, or
+               (None, None) if no confident reciprocal matches are found.
     """
     # This logic is for dense matching using 3D point clouds, adapted from get_im_matches
     pts3d_list_raw = [pred1['pts3d'], pred2['pts3d_in_other_view']]
@@ -525,17 +398,35 @@ def extract_matches_from_tile_prediction(pred1, pred2, shape1, shape2, conf_thr=
     matches_im1 = pts2d_list[1][reciprocal_in_PM]
     matches_im0 = pts2d_list[0][nnM_in_PQ][reciprocal_in_PM]
 
+    # Spatially sparsify dense matches for SfM tie points (audit H3 / perf):
+    # keep one correspondence per kpt_stride x kpt_stride pixel cell (keyed on the
+    # image-0 position). SfM only needs well-distributed tie points, so this
+    # preserves coverage and exact positions while cutting the dense match count
+    # ~stride**2 x, which prevents the multi-million-connection blowup in track
+    # building. Set kpt_stride<=1 to keep all dense matches.
+    if kpt_stride and kpt_stride > 1 and len(matches_im0) > 0:
+        cells = np.floor(np.asarray(matches_im0) / float(kpt_stride)).astype(np.int64)
+        _, keep_idx = np.unique(cells, axis=0, return_index=True)
+        keep_idx.sort()
+        matches_im0 = matches_im0[keep_idx]
+        matches_im1 = matches_im1[keep_idx]
+
     return matches_im0, matches_im1
 
 
 def deduplicate_and_format_for_colmap(
     aggregated_matches,
-    min_len_track=3,
+    min_len_track=2,
     distance_threshold=2.0
 ):
     """
     The main orchestration function. It uses helper functions to perform a
     robust, multi-step process of track building, filtering, and finalization.
+
+    ``min_len_track`` defaults to 2 so two-view correspondences survive for
+    narrow aerial strips; this must stay consistent with the mapper's
+    ``ignore_two_view_tracks=False`` (audit H2). Exposed as a CLI flag by the
+    orchestrator.
     """
     if not aggregated_matches:
         return {}, {}
@@ -544,16 +435,7 @@ def deduplicate_and_format_for_colmap(
     unique_kpts_per_image = _cluster_keypoints(aggregated_matches)
 
     # Step 2: Build pairwise connections and merge them into complete tracks.
-    # start_time = time.time()
     all_tracks = _build_and_merge_tracks(aggregated_matches, unique_kpts_per_image, distance_threshold=distance_threshold)
-    # print(f"Time for distance of 3: {time.time() - start_time} seconds")
-    # start_time = time.time()
-    # all_tracks_2 = _build_and_merge_tracks(aggregated_matches, unique_kpts_per_image, distance_threshold=4)
-    # print(f"Time for distance of 4: {time.time() - start_time} seconds")
-    # start_time = time.time()
-    # all_tracks_3 = _build_and_merge_tracks(aggregated_matches, unique_kpts_per_image, distance_threshold=2)
-    # print(f"Time for distance of 2.0: {time.time() - start_time} seconds")
-    
 
     # Step 3: Filter out short tracks and re-index the surviving keypoints and matches.
     final_keypoints, final_matches = _filter_and_finalize(
@@ -564,213 +446,237 @@ def deduplicate_and_format_for_colmap(
     return final_keypoints, final_matches
 
 
+def _get_tile_data(tile, image_handles):
+    """
+    Return the pixel array for a tile, cropping it on demand from a lazily-opened
+    source image (audit M4). Falls back to a pre-materialized ``tile_data`` when
+    present (e.g. the small-image fallback tile that is pasted onto a black
+    canvas). This avoids keeping every tile of every image resident in RAM.
+    """
+    data = tile.get('tile_data')
+    if data is not None:
+        return data
+    handle = image_handles[tile['parent_image_path']]
+    return np.array(handle.crop(tile['bounds_in_parent']).convert('RGB'))
+
+
 def run_chunked_mast3r_matching(
     model, device, image_pairs_to_match, root_path, colmap_db,
     precomputed_transforms,
-    tile_size=(512, 512), overlap_px=128, batch_size=4, conf_thr=3.0, dedup_distance=2.0):
+    tile_size=(512, 512), overlap_px=128, batch_size=4, conf_thr=1.5,
+    dedup_distance=2.0, min_len_track=2, min_overlap_area=1.0, tile_pairing='per_a',
+    pair_diagnostics=False, kpt_stride=8):
     """
     The COMPLETE REPLACEMENT for the original `run_mast3r_matching` function.
     It orchestrates the tiling, matching, aggregation, and database export.
+
+    Defaults reflect audit decisions: ``conf_thr`` defaults to 1.5 (raw pointmap
+    ``conf``, not descriptor confidence), ``min_len_track`` defaults to 2 (kept
+    consistent with the mapper's ``ignore_two_view_tracks=False``),
+    ``min_overlap_area`` gates tile-pair candidates, and ``tile_pairing`` selects
+    the pairing strategy ('per_a' best-B-per-A by default for speed; 'all' for
+    many-to-many, audit H6). All are overridable via CLI by the orchestrator.
     """
-    
+
+    # Defensive: collapse duplicate / reverse-direction pairs so the symmetric
+    # A<->B matching is never run twice. (tile_transform.py stores each pair in
+    # both directions; matching is symmetric, so this typically halves iterations.)
+    _seen = set()
+    _unique = []
+    for _p1, _p2 in image_pairs_to_match:
+        _k = tuple(sorted((_p1, _p2)))
+        if _k not in _seen:
+            _seen.add(_k)
+            _unique.append((_p1, _p2))
+    image_pairs_to_match = _unique
+
     # --- Part A: Tiling and Tile-Pair Determination ---
+    # Tiles are metadata-only (bounds) and pixels are cropped on demand from
+    # lazily-opened source images, so we never hold all tiles in RAM (audit M4).
     tile_cache = {}
+    image_handles = {}
     all_image_paths_abs = np.unique([p for pair in image_pairs_to_match for p in pair])
-    
+
     for image_path in tqdm(all_image_paths_abs, total=len(all_image_paths_abs), desc="Preparing tiles"):
         if image_path not in tile_cache:
-            tile_cache[image_path] = generate_image_tiles(image_path, tile_size, overlap_px, save_tile_data=False)
+            tile_cache[image_path] = generate_image_tiles(
+                image_path, tile_size, overlap_px, save_tile_data=False, keep_tile_data=False)
+            image_handles[image_path] = Image.open(image_path)
 
     # --- Part B: Inference on Tile Pairs and Match Aggregation ---
-    aggregated_matches_temp = {} # Use a temporary dictionary
-    # batch_size = 4 # Adjust based on GPU memory
-    
-    # --- START: NEW CACHING LOGIC ---
-    # This cache will store the computed tile pairs to avoid redundant work.
-    tile_pair_cache = {}
-    # --- END: NEW CACHING LOGIC ---
+    aggregated_matches_temp = {}
 
+    # Cache computed tile pairs per canonical image pair to avoid redundant work.
+    tile_pair_cache = {}
+
+    # Running totals for the optional per-pair coverage/cost diagnostic.
+    diag = {'n_all': 0, 'n_per_a': 0, 'n_selected': 0, 'cand_area': 0.0, 'per_a_area': 0.0}
 
     print("Beginning chunked feature matching...")
     for image_path1, image_path2 in tqdm(image_pairs_to_match, desc="Processing Image Pairs"):
-        
-        # --- START: NEW CACHING LOGIC ---
-        # Create a canonical (sorted) key to represent the pair regardless of order.
-        # image_name1 = os.path.basename(image_path1)
-        # image_name2 = os.path.basename(image_path2)
-        
+
+        tiles1 = tile_cache[image_path1]
+        tiles2 = tile_cache[image_path2]
+
+        # Canonical (sorted) key so pair order does not matter.
         canonical_key = tuple(sorted((image_path1, image_path2)))
-        
+
         if canonical_key in tile_pair_cache:
-            # If we've already computed pairs for this combination, retrieve them.
             cached_pairs = tile_pair_cache[canonical_key]
-            # Check if the current order is the same as the cached order.
             if image_path1 == canonical_key[0]:
-                # Order is the same, use as is.
                 overlapping_tile_pairs = cached_pairs
             else:
-                # Order is swapped, so we must swap the elements in each pair tuple.
                 overlapping_tile_pairs = [(b, a) for a, b in cached_pairs]
+            transform_1_to_2 = None  # not needed on cache hit
         else:
-            # This is a new pair, we need to compute the overlaps.
-            # name1_base = os.path.splitext(os.path.basename(image_name1))[0]
-            # name2_base = os.path.splitext(os.path.basename(image_name2))[0]
             name1_base = os.path.splitext(os.path.basename(image_path1))[0]
             name2_base = os.path.splitext(os.path.basename(image_path2))[0]
 
             transform_1_to_2 = precomputed_transforms.get((name1_base, name2_base))
 
-            # Important: Get inverse transform for symmetric calculation if needed.
-            # This part assumes transform for B->A might not be in the precomputed file.
+            # Fall back to the reverse transform (inverted) if A->B is missing.
             if transform_1_to_2 is None:
                 transform_2_to_1 = precomputed_transforms.get((name2_base, name1_base))
                 if transform_2_to_1 is not None:
-                    # Invert the B->A transform to get A->B
-                    M_inv = cv2.invertAffineTransform(transform_2_to_1)
-                    transform_1_to_2 = M_inv
+                    transform_1_to_2 = cv2.invertAffineTransform(transform_2_to_1)
                 else:
-                    continue # Skip if no transform is found
+                    continue  # Skip if no transform is found in either direction
 
-            tiles1 = tile_cache[image_path1]
-            tiles2 = tile_cache[image_path2]
-            # tiles1 = tile_cache[image_name1]
-            # tiles2 = tile_cache[image_name2]
-            
-            # Compute the tile pairs using our new one-to-one function.
-            overlapping_tile_pairs = determine_overlapping_tile_pairs(tiles1, tiles2, transform_1_to_2)
-            
-            # Store the result in the cache under the canonical key.
-            # We must check the canonical order to store it correctly.
+            overlapping_tile_pairs = determine_overlapping_tile_pairs(
+                tiles1, tiles2, transform_1_to_2,
+                min_overlap_area=min_overlap_area, mode=tile_pairing)
+
             if image_path1 == canonical_key[0]:
                 tile_pair_cache[canonical_key] = overlapping_tile_pairs
             else:
                 tile_pair_cache[canonical_key] = [(b, a) for a, b in overlapping_tile_pairs]
-                
-        if not overlapping_tile_pairs: continue
 
-        # Process all tile pairs for this image pair in batches
-        for i in tqdm(range(0, len(overlapping_tile_pairs), batch_size), desc="Matching Tile Pairs", total=len(overlapping_tile_pairs) // batch_size , leave=False, unit="pairs", unit_scale=1):
+        # Optional per-pair cost/coverage diagnostic (audit-discussion). Reports the
+        # many-to-many ('all') tile-pair count vs the best-B-per-A ('per_a') count,
+        # and the fraction of the matchable area per_a would cover relative to all.
+        if pair_diagnostics and transform_1_to_2 is not None:
+            cands = _tile_pair_candidates(tiles1, tiles2, transform_1_to_2, min_overlap_area)
+            cand_area = sum(a for a, _, _ in cands)
+            _best = {}
+            for _a, _ia, _ib in cands:
+                _cur = _best.get(_ia)
+                if _cur is None or _a > _cur[0]:
+                    _best[_ia] = (_a, _ib)
+            _per_a_area = sum(_a for _a, _ in _best.values())
+            _n_all = len(cands)
+            _n_per_a = len(_best)
+            _cov = (_per_a_area / cand_area * 100.0) if cand_area > 0 else 0.0
+            print(f"[diag] {os.path.basename(image_path1)} <-> {os.path.basename(image_path2)}: "
+                  f"A_tiles={len(tiles1)} B_tiles={len(tiles2)} | "
+                  f"all={_n_all} per_a={_n_per_a} mode={tile_pairing}->{len(overlapping_tile_pairs)} | "
+                  f"per_a covers ~{_cov:.0f}% of all-area")
+            diag['n_all'] += _n_all
+            diag['n_per_a'] += _n_per_a
+            diag['n_selected'] += len(overlapping_tile_pairs)
+            diag['cand_area'] += cand_area
+            diag['per_a_area'] += _per_a_area
+
+        if not overlapping_tile_pairs:
+            continue
+
+        # Process all tile pairs for this image pair in batches.
+        # NOTE: no explicit ``total=`` here so tqdm accounts for the final partial
+        # batch correctly (audit L5).
+        for i in tqdm(range(0, len(overlapping_tile_pairs), batch_size),
+                      desc="Matching Tile Pairs", leave=False, unit="pairs", unit_scale=1):
             batch_of_pairs = overlapping_tile_pairs[i:i + batch_size]
-            
-            # Create a LIST of TUPLES in the exact format `inference` expects.
-            inference_input_batch = []
-            for tile_a, tile_b in batch_of_pairs:
-                #
-                # --- CORRECT NORMALIZATION APPLIED HERE ---
-                # We apply the official ImgNorm directly to our tile data.
-                # The tile data is a numpy array (H, W, C), which is a valid
-                # input for ImgNorm (via its ToTensor() component).
-                # NO RESIZING IS NEEDED OR WANTED HERE.
-                #
-                img_a_tensor = ImgNorm(tile_a['tile_data'])
-                img_b_tensor = ImgNorm(tile_b['tile_data'])
-                
-                #
-                # --- START: THE CRUCIAL FIX FOR THE MODEL'S FORWARD PASS ---
-                #
-                # The model requires 'true_shape' for the patch embedder and
-                # 'instance' for the is_symmetrized check. We provide them here.
-                #
-                shape_a = torch.tensor(img_a_tensor.shape[-2:]).unsqueeze(0) # Shape: (1, 2)
-                shape_b = torch.tensor(img_b_tensor.shape[-2:]).unsqueeze(0)
-                
-                # The 'instance' key can be a dummy value since we are not using the
-                # symmetrized batch optimization. We use the tile_id for uniqueness.
-                instance_a = tile_a['tile_id']
-                instance_b = tile_b['tile_id']
 
-                # Create the dictionary with ALL required keys for the model.
+            inference_input_batch = []
+            batch_tensors = []  # reuse normalized tensors for extraction
+            for tile_a, tile_b in batch_of_pairs:
+                img_a_tensor = ImgNorm(_get_tile_data(tile_a, image_handles))
+                img_b_tensor = ImgNorm(_get_tile_data(tile_b, image_handles))
+
+                shape_a = torch.tensor(img_a_tensor.shape[-2:]).unsqueeze(0)
+                shape_b = torch.tensor(img_b_tensor.shape[-2:]).unsqueeze(0)
+
                 dict_a = {
                     'img': img_a_tensor.unsqueeze(0),
                     'true_shape': shape_a,
-                    'instance': instance_a
+                    'instance': tile_a['tile_id'],
                 }
                 dict_b = {
                     'img': img_b_tensor.unsqueeze(0),
                     'true_shape': shape_b,
-                    'instance': instance_b
+                    'instance': tile_b['tile_id'],
                 }
-                # --- END: THE CRUCIAL FIX ---
-                
-                # Append the TUPLE of dictionaries to our batch list.
                 inference_input_batch.append((dict_a, dict_b))
-                
+                batch_tensors.append((img_a_tensor, img_b_tensor))
+
             # Run inference.
             with torch.no_grad():
-                output = inference(inference_input_batch, model, device, batch_size=len(inference_input_batch), verbose=False)                
+                output = inference(inference_input_batch, model, device,
+                                   batch_size=len(inference_input_batch), verbose=False)
 
-            # The output predictions will be batched, so we need to access them correctly.
-            # The 'output' dictionary contains tensors where the first dimension is the batch size.
-
-            # Extract, re-project, and aggregate matches for each result in the batch
+            # Extract, re-project, and aggregate matches for each result in the batch.
             for j, (tile_a, tile_b) in enumerate(batch_of_pairs):
-                # We need to index into the batched prediction tensors
-                # write this in detail `pred1_single = {key: val[j] for key, val in output['pred1'].items()}`
-                pred1_single = {}
-                for key, val in output['pred1'].items():
-                    pred1_single[key] = val[j]     
-                                       
-                # pred2_single = {key: val[j] for key, val in output['pred2'].items()}
-                pred2_single = {}
-                for key, val in output['pred2'].items():
-                    pred2_single[key] = val[j]     
-                
-                #
-                # --- THIS IS THE UPDATED FUNCTION CALL ---
-                # We now pass the tensor shapes to the extraction function.
-                #
-                # We also need the tensor that was created *before* the unsqueeze(0)
-                img_a_tensor = ImgNorm(tile_a['tile_data'])
-                img_b_tensor = ImgNorm(tile_b['tile_data'])
+                img_a_tensor, img_b_tensor = batch_tensors[j]
+                pred1_single = {key: val[j] for key, val in output['pred1'].items()}
+                pred2_single = {key: val[j] for key, val in output['pred2'].items()}
 
                 kpts1_local, kpts2_local = extract_matches_from_tile_prediction(
                     pred1_single,
                     pred2_single,
-                    img_a_tensor.shape[-2:],  # Pass the (H, W) shape
-                    img_b_tensor.shape[-2:],  # Pass the (H, W) shape
+                    img_a_tensor.shape[-2:],
+                    img_b_tensor.shape[-2:],
                     conf_thr,
-                    device
+                    device,
+                    kpt_stride=kpt_stride,
                 )
 
-                if kpts1_local is None: continue
+                if kpts1_local is None:
+                    continue
 
-                # The rest of the re-projection logic remains the same
                 offset_a = tile_a["bounds_in_parent"][:2]
                 offset_b = tile_b["bounds_in_parent"][:2]
                 kpts1_global = kpts1_local + offset_a
                 kpts2_global = kpts2_local + offset_b
-                
+
                 pair_key = (image_path1, image_path2)
-                # pair_key = (image_name1, image_name2)
                 if pair_key not in aggregated_matches_temp:
                     aggregated_matches_temp[pair_key] = {"kpts0": [], "kpts1": []}
-                
+
                 aggregated_matches_temp[pair_key]["kpts0"].append(kpts1_global)
                 aggregated_matches_temp[pair_key]["kpts1"].append(kpts2_global)
-    
-    # --- START: NEW FINALIZATION STEP (THE FIX) ---
+
+    # Inference is finished; the model is not needed again. Move it to CPU and free
+    # the CUDA cache so the GPU is released before the (CPU-bound) aggregation,
+    # track-building and COLMAP steps run with an idle GPU.
+    try:
+        model.cpu()
+        torch.cuda.empty_cache()
+        print("[gpu] model moved to CPU and CUDA cache freed after matching.")
+    except Exception as _e:
+        print(f"[gpu] could not release GPU after matching: {_e}")
+
+    if pair_diagnostics:
+        _tot_cov = (diag['per_a_area'] / diag['cand_area'] * 100.0) if diag['cand_area'] > 0 else 0.0
+        print("[diag] === totals over all image pairs ===")
+        print(f"[diag]   tile-pair inferences: all={diag['n_all']}  per_a={diag['n_per_a']}  "
+              f"selected(mode={tile_pairing})={diag['n_selected']}")
+        print(f"[diag]   per_a would cover ~{_tot_cov:.0f}% of the all-area; "
+              f"all costs ~{diag['n_all'] / diag['n_per_a']:.1f}x per_a inferences"
+              if diag['n_per_a'] else "[diag]   (no per_a pairs)")
+
+    # --- Finalize aggregation: concatenate per-pair match arrays ---
     print("Finalizing match aggregation...")
     aggregated_matches_final = {}
     for pair_key, kpt_data in tqdm(aggregated_matches_temp.items(), total=len(aggregated_matches_temp), desc="Finalizing Matches", leave=False):
-        # Check if any matches were actually found for this pair
         if not kpt_data["kpts0"]:
             continue
-        
-        # Concatenate the list of arrays into a single large array for each key
-        final_kpts0 = np.concatenate(kpt_data["kpts0"], axis=0)
-        final_kpts1 = np.concatenate(kpt_data["kpts1"], axis=0)
-        
         aggregated_matches_final[pair_key] = {
-            "kpts0": final_kpts0,
-            "kpts1": final_kpts1
+            "kpts0": np.concatenate(kpt_data["kpts0"], axis=0),
+            "kpts1": np.concatenate(kpt_data["kpts1"], axis=0),
         }
-        
-    # # save the aggregated_matches_final for debugging or further processing
-    # torch.save(aggregated_matches_final, os.path.join(root_path, "aggregated_matches_final.pt"))
-    # --- END: NEW FINALIZATION STEP (THE FIX) ---
-    # torch.save(aggregated_matches_final, os.path.join(root_path, "aggregated_matches_final.pt"))
+
     # --- Part C: Deduplicate and Export ---
-    unique_kpts, indexed_matches = deduplicate_and_format_for_colmap(aggregated_matches_final, min_len_track=3, distance_threshold=dedup_distance)
+    unique_kpts, indexed_matches = deduplicate_and_format_for_colmap(
+        aggregated_matches_final, min_len_track=min_len_track, distance_threshold=dedup_distance)
     
     # Logic adapted from the END of original `export_matches`
     print("Exporting final keypoints and matches to COLMAP database...")
@@ -822,25 +728,35 @@ def run_chunked_mast3r_matching(
 
     return indexed_matches
 
-# It's good practice to disable the DecompressionBomb check for large images
-Image.MAX_IMAGE_PIXELS = None
+# Re-enable PIL's decompression-bomb guard with a generous limit instead of
+# disabling it process-wide (audit M8). 500 MP accommodates large aerial frames
+# while still rejecting absurd/malicious images; dimensions are additionally
+# validated inside generate_image_tiles.
+_DEFAULT_MAX_IMAGE_PIXELS = 500_000_000
+Image.MAX_IMAGE_PIXELS = _DEFAULT_MAX_IMAGE_PIXELS
 
-def generate_image_tiles(image_path, tile_size=(512, 512), overlap_px=128, save_tile_data=False):
+
+def generate_image_tiles(image_path, tile_size=(512, 512), overlap_px=128, save_tile_data=False,
+                         keep_tile_data=True, max_image_pixels=_DEFAULT_MAX_IMAGE_PIXELS):
     """
-    MODIFIED VERSION (Edge-Aligned Tiling).
-    Divides a large image into smaller, overlapping tiles. Instead of padding
-    edge tiles, this version ensures the last tile in each row/column is aligned
-    to the image edge, taking a full-sized tile. This may result in a larger
-    overlap for the last tile compared to others.
+    Edge-aligned tiling: divides a large image into overlapping tiles. Instead of
+    padding edge tiles, the last tile in each row/column is aligned to the image
+    edge (a full-sized tile), which may yield larger overlap for the last tile.
 
     Args:
         image_path (str): The file path to the high-resolution image.
-        tile_size (tuple): The (width, height) of the tiles to generate. This
-                           dimension MUST be divisible by the model's patch size.
+        tile_size (tuple): The (width, height) of the tiles to generate. MUST be
+                           divisible by the model's patch size.
         overlap_px (int): The *minimum* number of pixels of overlap between adjacent tiles.
+        save_tile_data (bool): If True, dump a lightweight tile manifest JSON.
+        keep_tile_data (bool): If True (default) tiles materialize ``tile_data`` as
+                               before. The chunked matcher passes False and crops
+                               pixels on demand via ``_get_tile_data`` to keep
+                               memory low (audit M4).
+        max_image_pixels (int): Per-image pixel cap for the decompression-bomb guard.
 
     Returns:
-        list: A list of dictionaries for each tile, guaranteed to have uniform size.
+        list: A list of tile dictionaries, all of uniform target size.
     """
     try:
         img = Image.open(image_path).convert('RGB')
@@ -849,12 +765,20 @@ def generate_image_tiles(image_path, tile_size=(512, 512), overlap_px=128, save_
         print(f"ERROR: Could not open image {image_path}. Reason: {e}")
         return []
 
+    # Explicit decompression-bomb guard (audit M8).
+    if max_image_pixels is not None and img_w * img_h > max_image_pixels:
+        raise ValueError(
+            f"Image {image_path} is {img_w}x{img_h} ({img_w * img_h} px), which "
+            f"exceeds the configured limit of {max_image_pixels} px.")
+
     tiles_manifest = []
     target_w, target_h = tile_size
-    
+
     # Check if the image is smaller than a single tile
     if img_w <= target_w or img_h <= target_h:
-        # If so, handle with the previous padding method as a fallback
+        # Fallback: paste the small image onto a black canvas of tile_size.
+        # This materializes tile_data (a single, small tile) regardless of
+        # keep_tile_data, since on-demand cropping could not reproduce the paste.
         final_tile = Image.new('RGB', tile_size, (0, 0, 0))
         final_tile.paste(img, (0, 0))
         tiles_manifest.append({
@@ -868,67 +792,42 @@ def generate_image_tiles(image_path, tile_size=(512, 512), overlap_px=128, save_
     # The stride is the distance to move for the start of the next tile.
     stride_w = target_w - overlap_px
     stride_h = target_h - overlap_px
-    
-    # --- START: NEW EDGE-ALIGNED COORDINATE GENERATION ---
-    
-    # Generate the list of starting y-coordinates
-    # We create all the "normal" starting points, and then add the final
-    # starting point that ensures the tile's bottom edge aligns with the image's bottom.
+
+    # Edge-aligned coordinate generation: normal starting points plus a final
+    # start that aligns the last tile's far edge with the image edge.
     y_starts = list(range(0, img_h - target_h, stride_h)) + [img_h - target_h]
-    
-    # Generate the list of starting x-coordinates, using the same logic
     x_starts = list(range(0, img_w - target_w, stride_w)) + [img_w - target_w]
 
-    # Use np.unique to prevent duplicate tiles if the image size is a perfect fit
+    # Prevent duplicate tiles when the image size is a perfect fit.
     y_starts = np.unique(y_starts).tolist()
     x_starts = np.unique(x_starts).tolist()
-    
-    # --- END: NEW EDGE-ALIGNED COORDINATE GENERATION ---
 
     tile_id_counter = 0
-    # The loops now iterate over the pre-calculated starting points
     for y in y_starts:
         for x in x_starts:
-            # The crop box is now guaranteed to be the target size and within bounds.
             bbox = (x, y, x + target_w, y + target_h)
             tile_img = img.crop(bbox)
 
             tile_info = {
                 "tile_id": f"{os.path.basename(image_path)}_tile_{tile_id_counter:04d}",
                 "parent_image_path": image_path,
-                # The bounds are the exact crop coordinates.
                 "bounds_in_parent": bbox,
-                # The tile_data is guaranteed to be the target size.
-                "tile_data": np.array(tile_img)
+                # Lazily cropped via _get_tile_data unless explicitly kept (audit M4).
+                "tile_data": np.array(tile_img) if keep_tile_data else None,
             }
             tiles_manifest.append(tile_info)
             tile_id_counter += 1
-            
-    # Save json in case we want to use it later            
-    # Prepare a lightweight version for JSON
+
+    # Optionally dump a lightweight manifest (without pixel data).
     if save_tile_data:
         tiles_manifest_json = [
-            {
-                k: v for k, v in tile.items() if k != "tile_data"
-            }
+            {k: v for k, v in tile.items() if k != "tile_data"}
             for tile in tiles_manifest
         ]
-
-        # Now safe to dump
         json.dump(tiles_manifest_json, open(f"{image_path}_tiles_manifest.json", 'w'), indent=4)
-                        
+
     return tiles_manifest
 
-
-def _check_bbox_intersection(boxA, boxB):
-    """Helper function to check if two bounding boxes intersect."""
-    # box format: [x_min, y_min, x_max, y_max]
-    x_left = max(boxA[0], boxB[0])
-    y_top = max(boxA[1], boxB[1])
-    x_right = min(boxA[2], boxB[2])
-    y_bottom = min(boxA[3], boxB[3])
-
-    return x_right >= x_left and y_bottom >= y_top
 
 def _calculate_intersection_area(boxA, boxB):
     """
@@ -952,61 +851,70 @@ def _calculate_intersection_area(boxA, boxB):
     return (x_right - x_left) * (y_bottom - y_top)
 
 
-def determine_overlapping_tile_pairs(tiles_A, tiles_B, transform_A_to_B):
+def _tile_pair_candidates(tiles_A, tiles_B, transform_A_to_B, min_overlap_area):
     """
-    MODIFIED VERSION (True One-to-One Best Match).
-    1. For each tile in A, finds the single best-matching tile in B by area.
-    2. If multiple tiles in A claim the same tile in B, it resolves the conflict,
-       keeping only the pairing with the largest overlap area.
-
-    Args:
-        tiles_A (list): The tile manifest for the source image A.
-        tiles_B (list): The tile manifest for the destination image B.
-        transform_A_to_B (np.ndarray): The 2x3 affine transformation matrix.
-
-    Returns:
-        list: A list of true one-to-one tile pair tuples.
+    Return all overlapping (A,B) tile candidates as a list of (area, idx_A, idx_B),
+    where `area` is the projected intersection area in px^2. Shared by the pairing
+    selection and the per-pair coverage diagnostic.
     """
     if transform_A_to_B is None or not tiles_A or not tiles_B:
         return []
-
-    # --- Pass 1: For each tile in A, find its best candidate in B ---
-    candidate_pairs = []
-    for tile_a in tiles_A:
-        best_match_tile_b = None
-        max_area = 0.0
-
+    candidates = []
+    for ia, tile_a in enumerate(tiles_A):
         x_min, y_min, x_max, y_max = tile_a["bounds_in_parent"]
-        corners_a = np.array([[[x_min, y_min]], [[x_max, y_min]], [[x_max, y_max]], [[x_min, y_max]]], dtype=np.float32)
+        corners_a = np.array([[[x_min, y_min]], [[x_max, y_min]],
+                              [[x_max, y_max]], [[x_min, y_max]]], dtype=np.float32)
         transformed_corners = cv2.transform(corners_a, transform_A_to_B)
-        
-        projected_bbox_in_B = [np.min(transformed_corners[:,:,0]), np.min(transformed_corners[:,:,1]), 
-                               np.max(transformed_corners[:,:,0]), np.max(transformed_corners[:,:,1])]
-
-        for tile_b in tiles_B:
+        projected_bbox_in_B = [np.min(transformed_corners[:, :, 0]),
+                               np.min(transformed_corners[:, :, 1]),
+                               np.max(transformed_corners[:, :, 0]),
+                               np.max(transformed_corners[:, :, 1])]
+        for ib, tile_b in enumerate(tiles_B):
             area = _calculate_intersection_area(projected_bbox_in_B, tile_b["bounds_in_parent"])
-            if area > max_area:
-                max_area = area
-                best_match_tile_b = tile_b
-        
-        if best_match_tile_b is not None and max_area > 1:
-            # Store the candidate and its overlap area for the next pass
-            candidate_pairs.append({'a': tile_a, 'b': best_match_tile_b, 'area': max_area})
+            if area >= min_overlap_area:
+                candidates.append((area, ia, ib))
+    return candidates
 
-    # --- Pass 2: De-conflict claims. Enforce that each B tile is claimed only once. ---
-    claimed_b_tiles = defaultdict(list)
-    for pair in candidate_pairs:
-        # Group all claims by the ID of the B tile
-        claimed_b_tiles[pair['b']['tile_id']].append(pair)
 
-    final_pairs = []
-    for b_tile_id, claims in claimed_b_tiles.items():
-        if len(claims) == 1:
-            # If there's only one claim, it's a valid match.
-            final_pairs.append((claims[0]['a'], claims[0]['b']))
-        else:
-            # If multiple A tiles claim this B tile, find the one with the best overlap area.
-            winner = max(claims, key=lambda x: x['area'])
-            final_pairs.append((winner['a'], winner['b']))
-            
-    return final_pairs
+def determine_overlapping_tile_pairs(tiles_A, tiles_B, transform_A_to_B, min_overlap_area=1.0, mode='per_a'):
+    """
+    Find overlapping tile pairs between two images using a geometric transform.
+
+    Audit H6 / performance: tile pairing trades coverage against inference cost
+    (each tile pair is one model inference).
+
+    - ``mode='per_a'`` (default): each A tile is matched to its single
+      highest-overlap B tile; a B tile may be chosen by several A tiles (no
+      "stealing"). Unlike the old strict one-to-one this never *drops* an A tile,
+      so coverage is near-complete at ~one inference per A tile (fast). Residual
+      thin slivers remain where an A tile straddles a B-grid boundary and spills
+      into a B tile it did not pick.
+    - ``mode='all'``: many-to-many. Every (A,B) above the threshold is kept. This
+      is the only fully gap-free option, but it matches each physical region
+      multiple times (e.g. ~4x for a 2x2 tile neighbourhood), which is largely
+      redundant after deduplication and is ~3-4x slower.
+
+    ``min_overlap_area`` and ``mode`` are exposed as CLI flags by the orchestrator.
+
+    Args:
+        tiles_A (list): Tile manifest for the source image A.
+        tiles_B (list): Tile manifest for the destination image B.
+        transform_A_to_B (np.ndarray): 2x3 affine matrix mapping A -> B pixels.
+        min_overlap_area (float): Minimum intersection area (px^2) for a candidate.
+        mode (str): 'per_a' (best-B-per-A, default) or 'all' (many-to-many).
+
+    Returns:
+        list: A list of (tile_a, tile_b) tuples.
+    """
+    candidates = _tile_pair_candidates(tiles_A, tiles_B, transform_A_to_B, min_overlap_area)
+
+    if mode == 'all':
+        return [(tiles_A[ia], tiles_B[ib]) for _, ia, ib in candidates]
+
+    # 'per_a': each A tile -> its single highest-overlap B tile (B may repeat).
+    best_for_a = {}
+    for area, ia, ib in candidates:
+        cur = best_for_a.get(ia)
+        if cur is None or area > cur[0]:
+            best_for_a[ia] = (area, ib)
+    return [(tiles_A[ia], tiles_B[ib]) for ia, (_, ib) in sorted(best_for_a.items())]
