@@ -856,15 +856,24 @@ def _tile_pair_candidates(tiles_A, tiles_B, transform_A_to_B, min_overlap_area):
     Return all overlapping (A,B) tile candidates as a list of (area, idx_A, idx_B),
     where `area` is the projected intersection area in px^2. Shared by the pairing
     selection and the per-pair coverage diagnostic.
+
+    ``transform_A_to_B`` may be either a 2x3 affine (``cv2.transform``) or a full
+    3x3 homography (``cv2.perspectiveTransform``). The latter is produced from EO
+    by ``eo_to_tilepairs.py`` and is required for oblique imagery; the affine form
+    remains the default (footprint-derived, near-nadir).
     """
     if transform_A_to_B is None or not tiles_A or not tiles_B:
         return []
+    is_homography = np.asarray(transform_A_to_B).shape == (3, 3)
     candidates = []
     for ia, tile_a in enumerate(tiles_A):
         x_min, y_min, x_max, y_max = tile_a["bounds_in_parent"]
         corners_a = np.array([[[x_min, y_min]], [[x_max, y_min]],
                               [[x_max, y_max]], [[x_min, y_max]]], dtype=np.float32)
-        transformed_corners = cv2.transform(corners_a, transform_A_to_B)
+        if is_homography:
+            transformed_corners = cv2.perspectiveTransform(corners_a, transform_A_to_B)
+        else:
+            transformed_corners = cv2.transform(corners_a, transform_A_to_B)
         projected_bbox_in_B = [np.min(transformed_corners[:, :, 0]),
                                np.min(transformed_corners[:, :, 1]),
                                np.max(transformed_corners[:, :, 0]),
@@ -899,7 +908,9 @@ def determine_overlapping_tile_pairs(tiles_A, tiles_B, transform_A_to_B, min_ove
     Args:
         tiles_A (list): Tile manifest for the source image A.
         tiles_B (list): Tile manifest for the destination image B.
-        transform_A_to_B (np.ndarray): 2x3 affine matrix mapping A -> B pixels.
+        transform_A_to_B (np.ndarray): 2x3 affine OR 3x3 homography mapping
+            A -> B pixels. A 3x3 triggers ``cv2.perspectiveTransform`` (needed for
+            EO-derived homographies on oblique imagery); 2x3 uses ``cv2.transform``.
         min_overlap_area (float): Minimum intersection area (px^2) for a candidate.
         mode (str): 'per_a' (best-B-per-A, default) or 'all' (many-to-many).
 

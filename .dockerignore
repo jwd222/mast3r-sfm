@@ -1,0 +1,29 @@
+# VCS
+.git/
+.gitignore
+
+# Python caches / build artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# Tooling caches
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# Editors / containers
+.vscode/
+.idea/
+.devcontainer/
+
+# OS junk
+.DS_Store
+Thumbs.db
